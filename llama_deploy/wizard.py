@@ -171,20 +171,32 @@ def _step_models() -> Tuple[ModelSpec, ModelSpec]:
     # --- LLM ---
     _section("Text generation model (LLM)")
     llm_presets = [
-        ("Qwen3-8B",     "Qwen/Qwen3-8B-GGUF · ~5 GB · 4-bit"),
+        ("Ministral-3-14B-Instruct-2512", "unsloth/Ministral-3-14B-Instruct-2512-GGUF · ~8-9 GB · 4-bit"),
         ("Qwen3-14B",    "Qwen/Qwen3-14B-GGUF · ~9 GB · 4-bit"),
     ]
+    llm_presets.extend([
+        ("Llama 3.1 8B Instruct", "bartowski/Llama-3.1-8B-Instruct-GGUF"),
+        ("Mistral 7B Instruct v0.3", "bartowski/Mistral-7B-Instruct-v0.3-GGUF"),
+        ("Gemma 2 9B IT", "bartowski/gemma-2-9b-it-GGUF"),
+        ("Phi-3.5 mini instruct", "bartowski/Phi-3.5-mini-instruct-GGUF"),
+    ])
     llm_idx = _choose(llm_presets, default=1, extra_label="Custom HuggingFace repo")
     if llm_idx <= len(llm_presets):
         llm_repos = [
-            ("Qwen/Qwen3-8B-GGUF",  ["Q4_K_M", "Q5_K_M", "Q4_0", "Q3_K_M"]),
+            ("unsloth/Ministral-3-14B-Instruct-2512-GGUF", ["Q4_K_M", "Q5_K_M", "Q4_0", "Q3_K_M"]),
             ("Qwen/Qwen3-14B-GGUF", ["Q4_K_M", "Q5_K_M", "Q4_0", "Q3_K_M"]),
         ]
+        llm_repos.extend([
+            ("bartowski/Llama-3.1-8B-Instruct-GGUF", ["Q4_K_M", "Q5_K_M", "Q4_0", "Q3_K_M"]),
+            ("bartowski/Mistral-7B-Instruct-v0.3-GGUF", ["Q4_K_M", "Q5_K_M", "Q4_0"]),
+            ("bartowski/gemma-2-9b-it-GGUF", ["Q4_K_M", "Q5_K_M", "Q4_0"]),
+            ("bartowski/Phi-3.5-mini-instruct-GGUF", ["Q4_K_M", "Q5_K_M", "Q4_0"]),
+        ])
         llm_repo, llm_patterns = llm_repos[llm_idx - 1]
     else:
         llm_repo = _prompt("HuggingFace repo (e.g. bartowski/Mistral-7B-GGUF)")
         if not llm_repo:
-            llm_repo = "Qwen/Qwen3-8B-GGUF"
+            llm_repo = "unsloth/Ministral-3-14B-Instruct-2512-GGUF"
             llm_patterns = ["Q4_K_M", "Q5_K_M", "Q4_0", "Q3_K_M"]
         else:
             raw_pats = _prompt("GGUF filename patterns (comma-separated)", "Q4_K_M,Q5_K_M")
@@ -197,12 +209,22 @@ def _step_models() -> Tuple[ModelSpec, ModelSpec]:
         ("Qwen3-Embedding-0.6B", "Qwen/Qwen3-Embedding-0.6B-GGUF · ~0.6 GB"),
         ("Qwen3-Embedding-4B",   "Qwen/Qwen3-Embedding-4B-GGUF · ~3 GB"),
     ]
+    emb_presets.extend([
+        ("Qwen3-Embedding-8B", "Qwen/Qwen3-Embedding-8B-GGUF"),
+        ("BGE base EN v1.5", "lmstudio-community/bge-base-en-v1.5-GGUF"),
+        ("BGE small EN v1.5", "lmstudio-community/bge-small-en-v1.5-GGUF"),
+    ])
     emb_idx = _choose(emb_presets, default=1, extra_label="Custom HuggingFace repo")
     if emb_idx <= len(emb_presets):
         emb_repos = [
             ("Qwen/Qwen3-Embedding-0.6B-GGUF", ["Q8_0", "F16", "Q6_K", "Q4_K_M"]),
             ("Qwen/Qwen3-Embedding-4B-GGUF",   ["Q8_0", "F16", "Q6_K", "Q4_K_M"]),
         ]
+        emb_repos.extend([
+            ("Qwen/Qwen3-Embedding-8B-GGUF", ["Q8_0", "F16", "Q6_K", "Q4_K_M"]),
+            ("lmstudio-community/bge-base-en-v1.5-GGUF", ["Q8_0", "F16", "Q6_K", "Q4_K_M"]),
+            ("lmstudio-community/bge-small-en-v1.5-GGUF", ["Q8_0", "F16", "Q6_K", "Q4_K_M"]),
+        ])
         emb_repo, emb_patterns = emb_repos[emb_idx - 1]
     else:
         emb_repo = _prompt("HuggingFace repo")
@@ -382,6 +404,7 @@ def run_wizard() -> Config:
         skip_download=False,
         llm=llm_spec,
         emb=emb_spec,
+        allow_unverified_downloads=False,
         domain=domain,
         certbot_email=certbot_email,
         auth_mode=auth_mode,

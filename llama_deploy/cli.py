@@ -95,8 +95,8 @@ def build_config(argv: Optional[List[str]] = None) -> Config:
                    help="HuggingFace access token. Falls back to HF_TOKEN env var.")
 
     g = parser.add_argument_group("Models")
-    g.add_argument("--llm-repo", default="Qwen/Qwen3-8B-GGUF", metavar="REPO",
-                   help="HuggingFace repo for the LLM GGUF. (default: Qwen/Qwen3-8B-GGUF)")
+    g.add_argument("--llm-repo", default="unsloth/Ministral-3-14B-Instruct-2512-GGUF", metavar="REPO",
+                   help="HuggingFace repo for the LLM GGUF. (default: unsloth/Ministral-3-14B-Instruct-2512-GGUF)")
     g.add_argument("--llm-candidates", default=_DEFAULT_LLM_CANDIDATES, metavar="PATTERNS",
                    help=f"Comma-separated GGUF filename patterns for LLM. (default: {_DEFAULT_LLM_CANDIDATES})")
     g.add_argument("--emb-repo", default="Qwen/Qwen3-Embedding-0.6B-GGUF", metavar="REPO",
@@ -105,6 +105,8 @@ def build_config(argv: Optional[List[str]] = None) -> Config:
                    help=f"Comma-separated GGUF filename patterns for embeddings. (default: {_DEFAULT_EMB_CANDIDATES})")
     g.add_argument("--skip-download", action="store_true",
                    help="Skip HF queries and downloads if model files are already on disk.")
+    g.add_argument("--allow-unverified-downloads", action="store_true",
+                   help="Allow continuing when SHA256 cannot be verified; non-interactive trust mode.")
 
     g = parser.add_argument_group("HTTPS / TLS (NGINX + Let's Encrypt)")
     g.add_argument("--domain", default=None, metavar="DOMAIN",
@@ -174,6 +176,7 @@ def build_config(argv: Optional[List[str]] = None) -> Config:
         skip_download=raw.skip_download,
         llm=llm_spec,
         emb=emb_spec,
+        allow_unverified_downloads=raw.allow_unverified_downloads,
         domain=raw.domain or None,
         certbot_email=raw.certbot_email or None,
         auth_mode=AuthMode(raw.auth_mode),

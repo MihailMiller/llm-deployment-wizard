@@ -3,7 +3,7 @@
 Deploy **llama.cpp** (`llama-server`) as a private, OpenAI-compatible REST API on an Ubuntu server — with one command, a guided wizard, and named API tokens you can revoke at any time.
 
 ```
-POST /v1/chat/completions   model="Qwen/Qwen3-8B"
+POST /v1/chat/completions   model="unsloth/Ministral-3-14B-Instruct-2512"
 POST /v1/embeddings         model="Qwen/Qwen3-Embedding-0.6B"
 GET  /v1/models
 ```
@@ -36,8 +36,8 @@ Everything is logged to `/var/log/llamacpp_deploy.log`.
 | Ubuntu 22.04 or 24.04 | Tested on both. Must have `systemd`. |
 | `sudo` or root access | The script re-executes itself via `sudo` if needed. |
 | Python 3.8+ | Already present on Ubuntu. `tqdm` is installed automatically if missing. |
-| 15–25 GB free disk | Depends on the models you choose (default: ~6 GB total). |
-| 4 GB RAM minimum | 8+ GB recommended for the default Qwen3-8B model. |
+| 15–25 GB free disk | Depends on the models you choose (default: ~10 GB total). |
+| 4 GB RAM minimum | 16+ GB recommended for the default Ministral-3-14B model. |
 | Internet access | To download the Docker image and GGUF files from HuggingFace. |
 
 ### Optional: GPU
@@ -59,7 +59,8 @@ If you use a private or gated model repository (e.g. Meta-Llama), set the `HF_TO
 export HF_TOKEN=hf_your_token_here
 ```
 
-The default models (Qwen3-8B, Qwen3-Embedding-0.6B) are public and do not require a token.
+The default models (Ministral-3-14B-Instruct-2512, Qwen3-Embedding-0.6B) are public and do not require a token.
+The wizard includes a larger preset catalog (Qwen, Llama, Mistral, Gemma, Phi, BGE) and can prompt you to switch models and retry if a download fails.
 
 ---
 
@@ -207,7 +208,7 @@ Authentication:
 
 Models:
   --llm-repo REPO       HuggingFace repo for the LLM GGUF.
-                        (default: Qwen/Qwen3-8B-GGUF)
+                        (default: unsloth/Ministral-3-14B-Instruct-2512-GGUF)
   --llm-candidates PAT  Comma-separated filename patterns for LLM GGUF.
                         (default: Q4_K_M,Q5_K_M,Q4_0,Q3_K_M)
   --emb-repo REPO       HuggingFace repo for the embedding GGUF.
@@ -215,6 +216,8 @@ Models:
   --emb-candidates PAT  Comma-separated filename patterns for embedding GGUF.
                         (default: Q8_0,F16,Q6_K,Q4_K_M)
   --skip-download       Skip HF queries/downloads if files are already on disk.
+  --allow-unverified-downloads
+                        Continue on SHA mismatch/missing checksum without prompt.
 
 HTTPS / TLS (NGINX + Let's Encrypt):
   --domain DOMAIN       Public domain name (e.g. api.example.com).
@@ -306,7 +309,7 @@ curl http://127.0.0.1:8080/v1/chat/completions \
   -H "Authorization: Bearer <token>" \
   -H "Content-Type: application/json" \
   -d '{
-    "model": "Qwen/Qwen3-8B",
+    "model": "unsloth/Ministral-3-14B-Instruct-2512",
     "messages": [{"role": "user", "content": "Hello!"}],
     "max_tokens": 200
   }'
@@ -335,7 +338,7 @@ client = OpenAI(
 )
 
 response = client.chat.completions.create(
-    model="Qwen/Qwen3-8B",
+    model="unsloth/Ministral-3-14B-Instruct-2512",
     messages=[{"role": "user", "content": "Hello!"}],
 )
 print(response.choices[0].message.content)
@@ -472,7 +475,7 @@ After deployment, `<base-dir>` (default `/opt/llama`) contains:
 ```
 /opt/llama/
 ├── models/
-│   ├── Qwen3-8B-Q4_K_M.gguf
+│   ├── Ministral-3-14B-Instruct-2512-Q4_K_M.gguf
 │   └── Qwen3-Embedding-0.6B-Q8_0.gguf
 ├── presets/
 │   └── models.ini
@@ -603,7 +606,7 @@ The wizard requires an interactive terminal (TTY). Use a real SSH session, not a
 Reload your shell or log out and back in: `exec bash -l`. Docker was just installed; the PATH needs refreshing.
 
 **Download fails or SHA-256 mismatch.**
-The partial `.part` file is kept for resumption. Re-run the deploy command; the download will resume from where it left off.
+In the interactive wizard flow, deployment now offers a retry loop: you can switch to another preset model (or enter a custom repo/pattern) and retry until one succeeds. In batch mode (non-interactive), retries are not prompted; set model flags explicitly or rerun with a different model repo.
 
 **The container starts but `/health` times out.**
 The model is still loading into memory. For large models on slow disks this can take several minutes. Increase the timeout by editing the `wait_health` call in `orchestrator.py`, or watch progress with:

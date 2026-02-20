@@ -1,7 +1,9 @@
 """
 HuggingFace model resolution and download.
 
-Public entry point: resolve_model(spec, dst_dir, hf_token) -> ModelSpec
+Public entry point:
+  resolve_model(spec, dst_dir, hf_token, allow_unverified_downloads=False)
+  -> ModelSpec
 Returns a new ModelSpec with resolved_filename / resolved_sha256 / resolved_size
 populated, and the GGUF file present on disk (strictly verified when upstream
 metadata includes sha256/size).
@@ -14,6 +16,7 @@ import hashlib
 import json
 import re
 import shutil
+import sys
 import urllib.error
 import urllib.request
 from pathlib import Path
@@ -25,10 +28,6 @@ from llama_deploy.log import die, log_line
 _METADATA_FALLBACK_REPOS = {
     # Some mirrors expose LFS metadata even when the upstream repo does not.
     "Qwen/Qwen3-8B-GGUF": "Aldaris/Qwen3-8B-Q4_K_M-GGUF",
-}
-_UNTRUSTED_API_SHA_REPOS = {
-    # Upstream API metadata can diverge from bytes served by pinned /resolve URLs.
-    "Qwen/Qwen3-8B-GGUF",
 }
 _SHA256_RE = re.compile(r"^[0-9a-fA-F]{64}$")
 
@@ -56,6 +55,43 @@ def _int_or_none(raw: Optional[str]) -> Optional[int]:
         return int(raw)
     except Exception:
         return None
+
+
+def _confirm_trust_unverified(
+    *,
+    repo: str,
+    revision: str,
+    filename: str,
+    reason: str,
+    allow_unverified_downloads: bool,
+) -> bool:
+    from tqdm import tqdm
+
+    if allow_unverified_downloads:
+        tqdm.write(
+            "[WARN] Proceeding with unverified download because "
+            "--allow-unverified-downloads is set."
+        )
+        return True
+
+    tqdm.write(f"[WARN] {reason}")
+    if not sys.stdin.isatty():
+        tqdm.write(
+            "[WARN] Non-interactive run: refusing unverified download. "
+            "Re-run with --allow-unverified-downloads to proceed."
+        )
+        return False
+
+    tqdm.write(f"[WARN] File: {repo}@{revision[:12]} / {filename}")
+    while True:
+        try:
+            ans = input("Trust this download and continue? [y/N]: ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            return False
+        if ans in ("y", "yes"):
+            return True
+        if ans in ("", "n", "no"):
+            return False
 
 
 # ---------------------------------------------------------------------------
@@ -187,6 +223,8 @@ def download_hf_file(
     expected_sha256: Optional[str],
     expected_size: Optional[int],
     hf_token: Optional[str],
+    *,
+    allow_unverified_downloads: bool = False,
 ) -> Tuple[str, int]:
     """
     Download a file from HuggingFace with tqdm progress.
@@ -296,18 +334,24 @@ def download_hf_file(
                 f"Accepting pinned file."
             )
             expected_sha256 = probe_sha
-        elif repo in _UNTRUSTED_API_SHA_REPOS and not probe_sha:
-            tqdm.write(
-                f"[WARN] SHA mismatch against HF API metadata for {repo}, but resolve headers "
-                f"do not expose a checksum. Accepting downloaded file with local sha256={got_sha}."
-            )
-            expected_sha256 = got_sha
         else:
-            die(
-                f"SHA256 mismatch for {dst.name}\n"
-                f"Expected: {expected_sha256}\n"
-                f"Got:      {got_sha}"
+            reason = (
+                f"SHA256 mismatch for {dst.name}. "
+                f"Expected {expected_sha256}, got {got_sha}. "
+                "Resolve headers did not provide a matching checksum."
             )
+            if not _confirm_trust_unverified(
+                repo=repo,
+                revision=revision,
+                filename=filename,
+                reason=reason,
+                allow_unverified_downloads=allow_unverified_downloads,
+            ):
+                die(
+                    f"SHA256 mismatch for {dst.name}\n"
+                    f"Expected: {expected_sha256}\n"
+                    f"Got:      {got_sha}"
+                )
 
     import os
     part.replace(dst)
@@ -324,7 +368,13 @@ def download_hf_file(
 # High-level entry point
 # ---------------------------------------------------------------------------
 
-def resolve_model(spec: ModelSpec, dst_dir: Path, hf_token: Optional[str]) -> ModelSpec:
+def resolve_model(
+    spec: ModelSpec,
+    dst_dir: Path,
+    hf_token: Optional[str],
+    *,
+    allow_unverified_downloads: bool = False,
+) -> ModelSpec:
     """
     Single public entry point for model resolution.
 
@@ -359,12 +409,6 @@ def resolve_model(spec: ModelSpec, dst_dir: Path, hf_token: Optional[str]) -> Mo
                     f"({probed_sha[:12]}...); using resolve header."
                 )
             sha256 = probed_sha
-        elif repo in _UNTRUSTED_API_SHA_REPOS and sha256 is not None:
-            tqdm.write(
-                f"[WARN] HF API sha256 for {repo} is known inconsistent and resolve headers "
-                f"did not expose a checksum. Falling back to best-effort verification."
-            )
-            sha256 = None
         return filename, size, sha256, revision
 
     resolved_repo = spec.hf_repo
@@ -414,13 +458,33 @@ def resolve_model(spec: ModelSpec, dst_dir: Path, hf_token: Optional[str]) -> Mo
     if size is None:
         tqdm.write(f"[WARN] Size unavailable for {filename}; progress may not show total bytes.")
     if sha256 is None:
-        tqdm.write(f"[WARN] sha256 unavailable for {filename}; strict checksum verification is skipped.")
+        if not _confirm_trust_unverified(
+            repo=resolved_repo,
+            revision=revision,
+            filename=filename,
+            reason=f"No sha256 metadata is available for {filename}.",
+            allow_unverified_downloads=allow_unverified_downloads,
+        ):
+            die(
+                f"Refusing unverified download for {filename}. "
+                "Approve trust interactively or re-run with --allow-unverified-downloads."
+            )
+        tqdm.write(f"[WARN] sha256 unavailable for {filename}; proceeding by user trust.")
 
     size_txt = f"{size / 1e9:.2f} GB" if size is not None else "size=?"
     sha_txt = f"{sha256[:12]}..." if sha256 else "sha256=?"
     tqdm.write(f"[HF] Resolved from {resolved_repo}@{revision[:12]}: {filename} ({size_txt}, {sha_txt})")
 
     dst = dst_dir / filename
-    local_sha, local_size = download_hf_file(resolved_repo, revision, filename, dst, sha256, size, hf_token)
+    local_sha, local_size = download_hf_file(
+        resolved_repo,
+        revision,
+        filename,
+        dst,
+        sha256,
+        size,
+        hf_token,
+        allow_unverified_downloads=allow_unverified_downloads,
+    )
 
     return spec.with_resolved(filename=filename, sha256=local_sha, size=local_size)

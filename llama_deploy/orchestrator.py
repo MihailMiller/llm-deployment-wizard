@@ -31,7 +31,7 @@ import datetime as dt
 import subprocess
 import sys
 from dataclasses import dataclass, field
-from typing import Any, Callable, List, Optional
+from typing import Any, Callable, List, Optional, Set, Tuple
 
 
 # ---------------------------------------------------------------------------
@@ -143,6 +143,137 @@ class TokenRuntime:
     temporary_id: Optional[str] = None
 
 
+_LLM_RETRY_PRESETS: List[Tuple[str, str, List[str]]] = [
+    ("Ministral-3-14B-Instruct-2512 (default)", "unsloth/Ministral-3-14B-Instruct-2512-GGUF", ["Q4_K_M", "Q5_K_M", "Q4_0", "Q3_K_M"]),
+    ("Qwen3-14B", "Qwen/Qwen3-14B-GGUF", ["Q4_K_M", "Q5_K_M", "Q4_0", "Q3_K_M"]),
+    ("Llama 3.1 8B Instruct", "bartowski/Llama-3.1-8B-Instruct-GGUF", ["Q4_K_M", "Q5_K_M", "Q4_0", "Q3_K_M"]),
+    ("Mistral 7B Instruct v0.3", "bartowski/Mistral-7B-Instruct-v0.3-GGUF", ["Q4_K_M", "Q5_K_M", "Q4_0"]),
+    ("Gemma 2 9B IT", "bartowski/gemma-2-9b-it-GGUF", ["Q4_K_M", "Q5_K_M", "Q4_0"]),
+    ("Phi-3.5 mini instruct", "bartowski/Phi-3.5-mini-instruct-GGUF", ["Q4_K_M", "Q5_K_M", "Q4_0"]),
+]
+
+_EMB_RETRY_PRESETS: List[Tuple[str, str, List[str]]] = [
+    ("Qwen3-Embedding-0.6B (default)", "Qwen/Qwen3-Embedding-0.6B-GGUF", ["Q8_0", "F16", "Q6_K", "Q4_K_M"]),
+    ("Qwen3-Embedding-4B", "Qwen/Qwen3-Embedding-4B-GGUF", ["Q8_0", "F16", "Q6_K", "Q4_K_M"]),
+    ("Qwen3-Embedding-8B", "Qwen/Qwen3-Embedding-8B-GGUF", ["Q8_0", "F16", "Q6_K", "Q4_K_M"]),
+    ("BGE base EN v1.5", "lmstudio-community/bge-base-en-v1.5-GGUF", ["Q8_0", "F16", "Q6_K", "Q4_K_M"]),
+    ("BGE small EN v1.5", "lmstudio-community/bge-small-en-v1.5-GGUF", ["Q8_0", "F16", "Q6_K", "Q4_K_M"]),
+]
+
+
+def _spec_key(spec) -> str:
+    return f"{spec.hf_repo}|{','.join(spec.candidate_patterns)}|{int(spec.is_embedding)}|{spec.ctx_len}"
+
+
+def _prompt_model_retry_choice(kind: str, current_spec, tried: Set[str]):
+    """
+    Ask the user which model to try next after a failed download.
+    Returns a new ModelSpec, or None if the user cancels.
+    """
+    from llama_deploy.config import ModelSpec
+
+    presets = _EMB_RETRY_PRESETS if current_spec.is_embedding else _LLM_RETRY_PRESETS
+    candidates: List[Tuple[str, ModelSpec]] = []
+    for label, repo, pats in presets:
+        spec = ModelSpec(
+            hf_repo=repo,
+            candidate_patterns=list(pats),
+            ctx_len=current_spec.ctx_len,
+            is_embedding=current_spec.is_embedding,
+        )
+        if _spec_key(spec) not in tried:
+            candidates.append((label, spec))
+
+    tqdm.write(f"[CHOICE] Select another {kind} model:")
+    for i, (label, spec) in enumerate(candidates, 1):
+        tqdm.write(f"  [{i}] {label}  ->  {spec.hf_repo}")
+    custom_idx = len(candidates) + 1
+    stop_idx = len(candidates) + 2
+    tqdm.write(f"  [{custom_idx}] Custom HuggingFace repo")
+    tqdm.write(f"  [{stop_idx}] Stop retries")
+
+    while True:
+        try:
+            raw = input(f"Choice [1-{stop_idx}] (default {custom_idx}): ").strip()
+        except (EOFError, KeyboardInterrupt):
+            return None
+        if not raw:
+            choice = custom_idx
+        elif raw.isdigit():
+            choice = int(raw)
+        else:
+            tqdm.write(f"[WARN] Please enter a number from 1 to {stop_idx}.")
+            continue
+
+        if 1 <= choice <= len(candidates):
+            return candidates[choice - 1][1]
+        if choice == custom_idx:
+            default_pats = ",".join(current_spec.candidate_patterns) if current_spec.candidate_patterns else (
+                "Q8_0,F16,Q6_K,Q4_K_M" if current_spec.is_embedding else "Q4_K_M,Q5_K_M,Q4_0,Q3_K_M"
+            )
+            repo = input("HuggingFace repo: ").strip()
+            if not repo:
+                tqdm.write("[WARN] Repo cannot be empty.")
+                continue
+            raw_pats = input(f"GGUF filename patterns (comma-separated) [{default_pats}]: ").strip()
+            if not raw_pats:
+                raw_pats = default_pats
+            pats = [p.strip() for p in raw_pats.split(",") if p.strip()]
+            if not pats:
+                tqdm.write("[WARN] At least one pattern is required.")
+                continue
+            return ModelSpec(
+                hf_repo=repo,
+                candidate_patterns=pats,
+                ctx_len=current_spec.ctx_len,
+                is_embedding=current_spec.is_embedding,
+            )
+        if choice == stop_idx:
+            return None
+        tqdm.write(f"[WARN] Please enter a number from 1 to {stop_idx}.")
+
+
+def _resolve_model_with_retry(cfg, initial_spec, kind: str):
+    """
+    Try downloading a model; on failure in interactive mode, let the user pick
+    another model and retry until success or cancellation.
+    """
+    from llama_deploy.model import resolve_model
+
+    spec = initial_spec
+    tried: Set[str] = set()
+    attempt = 0
+
+    while True:
+        attempt += 1
+        tried.add(_spec_key(spec))
+        if attempt > 1:
+            tqdm.write(f"[INFO] Retrying {kind} with {spec.hf_repo} ...")
+        try:
+            return resolve_model(
+                spec,
+                cfg.models_dir,
+                cfg.hf_token,
+                allow_unverified_downloads=cfg.allow_unverified_downloads,
+            )
+        except SystemExit as e:
+            if not sys.stdin.isatty():
+                raise
+            if int(getattr(e, "code", 1) or 1) == 0:
+                raise
+            tqdm.write(f"[WARN] {kind} model attempt failed for {spec.hf_repo}.")
+            try:
+                ans = input(f"Switch to a different {kind} model and retry? [y/N]: ").strip().lower()
+            except (EOFError, KeyboardInterrupt):
+                raise
+            if ans not in ("y", "yes"):
+                raise
+            next_spec = _prompt_model_retry_choice(kind, spec, tried)
+            if next_spec is None:
+                raise
+            spec = next_spec
+
+
 def run_steps(steps: List[Step], bar: tqdm) -> None:
     from llama_deploy.log import log_line
     import time
@@ -222,7 +353,6 @@ def run_deploy(cfg) -> None:
         ensure_swap,
         ensure_firewall,
     )
-    from llama_deploy.model import resolve_model
     from llama_deploy.tokens import TokenStore
     from llama_deploy.service import (
         write_models_ini,
@@ -275,12 +405,12 @@ def run_deploy(cfg) -> None:
     # -----------------------------------------------------------------------
     llm_step = Step(
         label="Resolve + download LLM GGUF",
-        fn=lambda: resolve_model(cfg.llm, cfg.models_dir, cfg.hf_token),
+        fn=lambda: _resolve_model_with_retry(cfg, cfg.llm, "LLM"),
         skip_if=lambda: cfg.skip_download,
     )
     emb_step = Step(
         label="Resolve + download embedding GGUF",
-        fn=lambda: resolve_model(cfg.emb, cfg.models_dir, cfg.hf_token),
+        fn=lambda: _resolve_model_with_retry(cfg, cfg.emb, "Embedding"),
         skip_if=lambda: cfg.skip_download,
     )
 

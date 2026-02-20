@@ -155,6 +155,7 @@ class Config:
     skip_download: bool           # skip HF queries if model files already verified
     llm: ModelSpec
     emb: ModelSpec
+    allow_unverified_downloads: bool = False  # permit trusting downloads when upstream SHA cannot be proven
     domain: Optional[str] = None          # public domain for NGINX + Let's Encrypt TLS
     certbot_email: Optional[str] = None   # email for Let's Encrypt renewal notices
     auth_mode: AuthMode = AuthMode.PLAINTEXT  # token storage strategy
