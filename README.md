@@ -1,6 +1,11 @@
-﻿# llama_deploy
+﻿# LLM Deployment Wizard: Beginner-Friendly Private LLM API / Open WebUI Deployment
 
-Deploy **llama.cpp** (`llama-server`) as a private, OpenAI-compatible REST API on an Ubuntu server — with one command, a guided wizard, and named API tokens you can revoke at any time.
+Deploy **llama.cpp** (`llama-server`) as a private, OpenAI-compatible REST API on Ubuntu with one command and a guided wizard.
+
+If you are new to self-hosting, this project gives you a safe default path:
+- Private by default (`127.0.0.1`, firewall-aware, no accidental public exposure)
+- Guided setup (wizard chooses sane defaults and explains networking choices)
+- Production basics included (Docker, NGINX/TLS options, token lifecycle, logs)
 
 ```
 POST /v1/chat/completions   model="Qwen/Qwen3-8B"
@@ -8,9 +13,40 @@ POST /v1/embeddings         model="Qwen/Qwen3-Embedding-0.6B"
 GET  /v1/models
 ```
 
-The server runs inside Docker, is bound to localhost by default, uses a hardened read-only container, and is never exposed to the internet unless you explicitly choose it.
+The server runs in Docker, uses hardened container settings, and is never exposed to the internet unless you explicitly choose it.
 
-**Access profiles** let you deploy for different use cases without needing to know the underlying UFW/bind details:
+## Why use this? (Value proposition)
+
+Without this tool, a typical deployment means wiring together Docker, model downloads, token handling, firewall rules, reverse proxy config, TLS certificates, and health checks yourself.
+
+`llama_deploy` combines that into one flow so you can:
+- Get from zero to a working `/v1/chat/completions` endpoint quickly
+- Keep a safer default security posture as a beginner
+- Re-deploy safely without rebuilding everything by hand
+- Rotate/revoke named API tokens without manual file surgery
+
+## Start here (first deployment)
+
+```bash
+git clone <repo-url> /opt/llama_deploy
+cd /opt/llama_deploy
+sudo python3 -m llama_deploy
+```
+
+When deployment finishes, copy the token shown once and test:
+
+```bash
+curl http://127.0.0.1:8080/v1/models \
+  -H "Authorization: Bearer <token>"
+```
+
+If this returns JSON model metadata, your local API is up.
+
+---
+
+## Access profiles (choose exposure level)
+
+Access profiles let you deploy for different use cases without needing to know the underlying UFW/bind details:
 
 | Profile | Who can reach the API | No port-forwarding needed |
 |---|---|---|
@@ -21,7 +57,7 @@ The server runs inside Docker, is bound to localhost by default, uses a hardened
 
 ---
 
-## What this does
+## What this does for you
 
 | Step | What happens |
 |---|---|
@@ -95,7 +131,7 @@ Run without arguments on any terminal that has a TTY:
 sudo python3 -m llama_deploy
 ```
 
-You will be guided through five steps:
+You will be guided through six steps:
 
 ```
 ╔════════════════════════════════════════════════════╗
@@ -104,7 +140,7 @@ You will be guided through five steps:
 ╚════════════════════════════════════════════════════╝
 
 ╔════════════════════════════════════════════════════╗
-║  Step 1/5 · Backend                               ║
+║  Step 1/6 · Backend                               ║
 ╚════════════════════════════════════════════════════╝
 
 What hardware acceleration do you have?
@@ -117,7 +153,7 @@ What hardware acceleration do you have?
 Choice [1]:
 
 ╔════════════════════════════════════════════════════╗
-║  Step 3/5 · Network                               ║
+║  Step 3/6 · Network                               ║
 ╚════════════════════════════════════════════════════╝
 
   Choose who should be able to reach the API:
@@ -131,7 +167,7 @@ Choice [1]:
 Choice [1]:
 ```
 
-After step 5, a review summary is shown and you confirm before anything is written to disk.
+After step 6, a review summary is shown and you confirm before anything is written to disk.
 
 At the end of deployment your API token is printed **once**:
 
@@ -395,7 +431,7 @@ Use the `home-private` profile to make the API reachable anywhere on your home L
 
 ### Via the wizard
 
-Select **[2] Home / LAN network** in Step 3/5 · Network / Access Profile:
+Select **[2] Home / LAN network** in Step 3/6 · Network / Access Profile:
 
 ```
   [2] Home / LAN network   LAN CIDR — private network access, UFW-restricted
@@ -455,7 +491,7 @@ The `vpn-only` profile keeps the API on loopback and uses Tailscale to create a 
 
 ### Via the wizard
 
-Select **[3] VPN only (Tailscale)** in Step 3/5 · Network / Access Profile. In Step 5 (System) you will be prompted for an optional auth key.
+Select **[3] VPN only (Tailscale)** in Step 3/6 · Network / Access Profile. In Step 6 (System) you will be prompted for an optional auth key.
 
 ### Via batch mode
 
@@ -521,7 +557,7 @@ Internet ──HTTPS 443──► NGINX ──HTTP──► 127.0.0.1:8080 (Dock
 
 ### Via the wizard
 
-Select **[4] Internet / Public** → **[1] HTTPS + domain** in Step 3/5 · Network / Access Profile:
+Select **[4] Internet / Public** → **[1] HTTPS + domain** in Step 3/6 · Network / Access Profile:
 
 ```
   [4] Internet / Public     NGINX + Let's Encrypt TLS — or direct 0.0.0.0
@@ -775,7 +811,7 @@ llama_deploy/
 ├── system.py         ensure_*() idempotent OS operations (UFW rules are profile-aware)
 ├── tailscale.py      Tailscale install, up, IP retrieval, health check
 ├── tokens.py         TokenRecord, TokenStore (create / revoke / sync keyfile)
-└── wizard.py         interactive 5-step HITL wizard → Config
+└── wizard.py         interactive 6-step HITL wizard → Config
 ```
 
 ---
