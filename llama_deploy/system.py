@@ -166,7 +166,7 @@ def ensure_docker() -> None:
     sh("export DEBIAN_FRONTEND=noninteractive; apt-get update -y")
     sh("export DEBIAN_FRONTEND=noninteractive; apt-get install -y ca-certificates curl gnupg")
     sh("install -m 0755 -d /etc/apt/keyrings")
-    sh("curl -fsSL https://download.docker.com/linux/ubuntu/gpg | gpg --no-tty --dearmor -o /etc/apt/keyrings/docker.gpg")
+    sh("curl -fsSL https://download.docker.com/linux/ubuntu/gpg | gpg --batch --yes --no-tty --dearmor -o /etc/apt/keyrings/docker.gpg")
     sh(
         'echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] '
         'https://download.docker.com/linux/ubuntu $(. /etc/os-release && echo $VERSION_CODENAME) stable" '
