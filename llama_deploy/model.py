@@ -66,8 +66,9 @@ def pick_hf_file(meta: Dict[str, Any], spec: ModelSpec) -> Tuple[str, int, str]:
     }
 
     for pattern in spec.candidate_patterns:
-        # First try exact match, then substring match
-        matches = [name for name in by_name if pattern in name]
+        pattern_l = pattern.lower()
+        # Case-insensitive substring match to handle repos with lowercase filenames.
+        matches = [name for name in by_name if pattern_l in name.lower()]
         if not matches:
             continue
         # Prefer shorter name (less quantization suffixes) among substring matches
