@@ -117,6 +117,16 @@ def _webui_location_block(webui_port: int) -> str:
     responses and real-time features.
     """
     return f"""
+    # Compatibility: some Open WebUI flows/routes may land on /chat.
+    # Route it to the WebUI root instead of returning a backend 404.
+    location = /chat {{
+        return 302 /;
+    }}
+
+    location = /chat/ {{
+        return 302 /;
+    }}
+
     # Open WebUI — served at domain root; protected by Open WebUI's own user auth
     location / {{
         proxy_pass         http://127.0.0.1:{webui_port};

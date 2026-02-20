@@ -69,6 +69,7 @@ class NginxConfigTests(unittest.TestCase):
                 8081,
                 use_auth_sidecar=True,
                 sidecar_port=9000,
+                webui_port=0,
             )
 
     def test_ensure_local_proxy_reuses_existing_site_port(self) -> None:
@@ -104,7 +105,41 @@ class NginxConfigTests(unittest.TestCase):
                 8081,
                 use_auth_sidecar=True,
                 sidecar_port=9000,
+                webui_port=0,
             )
+
+    def test_local_config_with_webui_adds_chat_compat_redirect(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            sites_available = root / "sites-available"
+            sites_enabled = root / "sites-enabled"
+            sites_available.mkdir(parents=True, exist_ok=True)
+            sites_enabled.mkdir(parents=True, exist_ok=True)
+
+            captured = {}
+
+            def _fake_write_file(path: Path, content: str, *, mode=None) -> None:
+                captured["path"] = path
+                captured["content"] = content
+                captured["mode"] = mode
+
+            with mock.patch.object(nginx, "_SITES_AVAILABLE", sites_available), \
+                 mock.patch.object(nginx, "_SITES_ENABLED", sites_enabled), \
+                 mock.patch("llama_deploy.system.write_file", side_effect=_fake_write_file), \
+                 mock.patch.object(nginx, "sh"), \
+                 mock.patch("pathlib.Path.symlink_to", return_value=None):
+                nginx.write_nginx_local_config(
+                    bind_host="127.0.0.1",
+                    port=8080,
+                    upstream_port=8081,
+                    use_auth_sidecar=True,
+                    sidecar_port=9000,
+                    webui_port=3000,
+                )
+
+            self.assertIn("location = /chat", captured["content"])
+            self.assertIn("return 302 /;", captured["content"])
+            self.assertIn("proxy_pass         http://127.0.0.1:3000;", captured["content"])
 
 
 if __name__ == "__main__":
