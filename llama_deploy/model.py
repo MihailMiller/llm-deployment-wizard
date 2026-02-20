@@ -20,6 +20,11 @@ from typing import Any, Dict, Optional, Tuple
 from llama_deploy.config import ModelSpec
 from llama_deploy.log import die, log_line
 
+_METADATA_FALLBACK_REPOS = {
+    # Some mirrors expose LFS metadata even when the upstream repo does not.
+    "Qwen/Qwen3-8B-GGUF": "Aldaris/Qwen3-8B-Q4_K_M-GGUF",
+}
+
 
 # ---------------------------------------------------------------------------
 # HuggingFace API
@@ -72,13 +77,13 @@ def pick_hf_file(meta: Dict[str, Any], spec: ModelSpec) -> Tuple[str, int, str]:
         sha = lfs.get("sha256") or lfs.get("oid")
         size = lfs.get("size") or s.get("size")
         if not sha or not size:
-            die(
+            raise ValueError(
                 f"HF metadata for '{chosen}' is missing sha256/size. "
                 f"The repo may not expose LFS metadata publicly."
             )
         return chosen, int(size), str(sha)
 
-    die(
+    raise ValueError(
         f"None of the candidate patterns matched any file in repo '{spec.hf_repo}'. "
         f"Tried patterns: {spec.candidate_patterns}. "
         f"Available files: {sorted(by_name.keys())}"
@@ -218,12 +223,41 @@ def resolve_model(spec: ModelSpec, dst_dir: Path, hf_token: Optional[str]) -> Mo
     """
     from tqdm import tqdm
 
-    tqdm.write(f"[HF] Querying metadata for {spec.hf_repo}")
-    meta = hf_model_metadata(spec.hf_repo, hf_token)
-    filename, size, sha256 = pick_hf_file(meta, spec)
-    tqdm.write(f"[HF] Resolved: {filename} ({size / 1e9:.2f} GB, sha256={sha256[:12]}...)")
+    resolved_repo = spec.hf_repo
+    tqdm.write(f"[HF] Querying metadata for {resolved_repo}")
+    meta = hf_model_metadata(resolved_repo, hf_token)
+
+    try:
+        filename, size, sha256 = pick_hf_file(meta, spec)
+    except ValueError as e:
+        fallback_repo = _METADATA_FALLBACK_REPOS.get(spec.hf_repo)
+        if fallback_repo and "missing sha256/size" in str(e):
+            tqdm.write(f"[WARN] {e}")
+            tqdm.write(f"[HF] Retrying metadata from fallback repo: {fallback_repo}")
+            log_line(f"[HF] Retrying metadata from fallback repo: {fallback_repo}")
+
+            fallback_spec = ModelSpec(
+                hf_repo=fallback_repo,
+                candidate_patterns=spec.candidate_patterns,
+                ctx_len=spec.ctx_len,
+                alias=spec.effective_alias,  # keep original served model alias stable
+                is_embedding=spec.is_embedding,
+            )
+            resolved_repo = fallback_repo
+            meta = hf_model_metadata(resolved_repo, hf_token)
+            try:
+                filename, size, sha256 = pick_hf_file(meta, fallback_spec)
+            except ValueError as e2:
+                die(f"{e} Fallback repo '{fallback_repo}' also failed: {e2}")
+        else:
+            die(str(e))
+
+    tqdm.write(
+        f"[HF] Resolved from {resolved_repo}: {filename} "
+        f"({size / 1e9:.2f} GB, sha256={sha256[:12]}...)"
+    )
 
     dst = dst_dir / filename
-    download_hf_file(spec.hf_repo, filename, dst, sha256, size, hf_token)
+    download_hf_file(resolved_repo, filename, dst, sha256, size, hf_token)
 
     return spec.with_resolved(filename=filename, sha256=sha256, size=size)
