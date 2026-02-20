@@ -780,6 +780,21 @@ The wizard requires an interactive terminal (TTY). Use a real SSH session, not a
 **`docker: command not found` after the script runs.**
 Reload your shell or log out and back in: `exec bash -l`. Docker was just installed; the PATH needs refreshing.
 
+**`failed to create network ... all predefined address pools have been fully subnetted`.**
+Your Docker host ran out of bridge subnets. `llama_deploy` now configures non-overlapping `default-address-pools` automatically, but existing conflicting Docker bridges can still break routing (for example overlapping with LAN/VPN ranges like `172.22.0.0/16`).
+
+Prune unused bridge networks, then retry:
+```bash
+docker network prune -f
+```
+If needed, remove specific conflicting networks instead of global prune:
+```bash
+docker network ls --filter driver=bridge
+docker network inspect <network_name>
+docker network rm <network_name>
+```
+During deploy, a preflight check now aborts early when Docker bridge subnets overlap host routes so the failure is explicit.
+
 **Download fails or SHA-256 mismatch.**
 In the interactive wizard flow, deployment now offers a retry loop: you can switch to another preset model (or enter a custom repo/pattern) and retry until one succeeds. In batch mode (non-interactive), retries are not prompted; set model flags explicitly or rerun with a different model repo.
 

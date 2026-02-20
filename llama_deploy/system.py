@@ -7,13 +7,14 @@ All functions are designed to be safe to call multiple times (idempotent).
 from __future__ import annotations
 
 import datetime as dt
+import ipaddress
 import os
 import re
 import shutil
 import subprocess
 from pathlib import Path
 from shlex import quote
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 from llama_deploy.log import die, log_line, sh
 
@@ -213,13 +214,183 @@ def ensure_firewall(network) -> None:
 # Docker
 # ---------------------------------------------------------------------------
 
+def _parse_ipv4_network(raw: str) -> Optional[ipaddress.IPv4Network]:
+    raw = (raw or "").strip()
+    if not raw or raw == "default":
+        return None
+    if "/" not in raw:
+        raw = f"{raw}/32"
+    try:
+        net = ipaddress.ip_network(raw, strict=False)
+    except ValueError:
+        return None
+    if isinstance(net, ipaddress.IPv4Network):
+        return net
+    return None
+
+
+def _host_ipv4_routes(*, include_docker_interfaces: bool = True) -> List[ipaddress.IPv4Network]:
+    """
+    Return IPv4 route destinations from the host routing table.
+
+    We only need destination prefixes (first token of each `ip route` line) to
+    detect overlap with Docker bridge subnets.
+    """
+    routes: List[ipaddress.IPv4Network] = []
+    try:
+        out = subprocess.check_output(
+            ["ip", "-o", "-4", "route", "show"],
+            text=True,
+            stderr=subprocess.DEVNULL,
+        )
+    except Exception:
+        return routes
+
+    for line in out.splitlines():
+        parts = line.split()
+        if not parts:
+            continue
+        dev = None
+        if "dev" in parts:
+            idx = parts.index("dev")
+            if idx + 1 < len(parts):
+                dev = parts[idx + 1]
+
+        if (
+            not include_docker_interfaces
+            and dev
+            and (dev == "docker0" or dev.startswith("br-") or dev.startswith("veth"))
+        ):
+            continue
+
+        net = _parse_ipv4_network(parts[0])
+        if net is not None:
+            routes.append(net)
+    return routes
+
+
+def _docker_bridge_subnets() -> List[Tuple[str, ipaddress.IPv4Network]]:
+    """
+    Return (network_name, subnet) tuples for Docker bridge networks.
+    """
+    items: List[Tuple[str, ipaddress.IPv4Network]] = []
+    try:
+        names_out = subprocess.check_output(
+            ["docker", "network", "ls", "--filter", "driver=bridge", "--format", "{{.Name}}"],
+            text=True,
+            stderr=subprocess.DEVNULL,
+        )
+    except Exception:
+        return items
+
+    for name in [ln.strip() for ln in names_out.splitlines() if ln.strip()]:
+        try:
+            subnets_out = subprocess.check_output(
+                [
+                    "docker",
+                    "network",
+                    "inspect",
+                    name,
+                    "--format",
+                    "{{range .IPAM.Config}}{{.Subnet}}{{\"\\n\"}}{{end}}",
+                ],
+                text=True,
+                stderr=subprocess.DEVNULL,
+            )
+        except Exception:
+            continue
+
+        for raw in subnets_out.splitlines():
+            net = _parse_ipv4_network(raw)
+            if net is not None:
+                items.append((name, net))
+    return items
+
+
+def _choose_default_address_pools(
+    occupied: List[ipaddress.IPv4Network],
+    pool_count: int = 2,
+) -> List[dict]:
+    """
+    Choose non-overlapping Docker default-address-pools from preferred ranges.
+    """
+    chosen: List[dict] = []
+
+    candidates: List[ipaddress.IPv4Network] = [
+        *[ipaddress.ip_network(f"10.{octet}.0.0/16") for octet in range(200, 256)],
+        ipaddress.ip_network("192.168.240.0/20"),
+        ipaddress.ip_network("192.168.224.0/20"),
+        ipaddress.ip_network("198.18.0.0/16"),
+        ipaddress.ip_network("198.19.0.0/16"),
+    ]
+
+    for base in candidates:
+        if any(base.overlaps(net) for net in occupied):
+            continue
+        chosen.append({"base": str(base), "size": 24})
+        if len(chosen) >= pool_count:
+            return chosen
+
+    die(
+        "Could not choose non-overlapping Docker default-address-pools. "
+        "Please set /etc/docker/daemon.json default-address-pools manually."
+    )
+
+
+def _bridge_route_conflicts() -> List[Tuple[str, ipaddress.IPv4Network, ipaddress.IPv4Network]]:
+    """
+    Return bridge subnets that overlap non-default host routes.
+    """
+    conflicts: List[Tuple[str, ipaddress.IPv4Network, ipaddress.IPv4Network]] = []
+    host_routes = _host_ipv4_routes(include_docker_interfaces=False)
+    bridge_subnets = _docker_bridge_subnets()
+
+    for bridge_name, bridge_net in bridge_subnets:
+        for route_net in host_routes:
+            if bridge_net == route_net:
+                conflicts.append((bridge_name, bridge_net, route_net))
+                continue
+            if bridge_net.overlaps(route_net):
+                conflicts.append((bridge_name, bridge_net, route_net))
+    return conflicts
+
+
+def _fail_on_bridge_route_conflicts() -> None:
+    """
+    Abort early when Docker bridge subnets shadow host routes.
+    """
+    conflicts = _bridge_route_conflicts()
+    if not conflicts:
+        return
+
+    lines = [
+        f"- {name}: {bridge} overlaps host route {route}"
+        for name, bridge, route in conflicts[:8]
+    ]
+    if len(conflicts) > 8:
+        lines.append(f"- ... and {len(conflicts) - 8} more")
+
+    detail = "\n".join(lines)
+    die(
+        "Detected Docker bridge subnet overlap with host routes. "
+        "This can blackhole return traffic from LAN/VPN clients.\n"
+        f"{detail}\n"
+        "Fix: remove conflicting Docker bridge networks and retry "
+        "(e.g. `docker network prune -f`, or targeted `docker network rm <name>`)."
+    )
+
+
 def ensure_docker_daemon_hardening() -> None:
     """
-    Write /etc/docker/daemon.json with iptables=false.
+    Write /etc/docker/daemon.json with hardened networking defaults.
 
     Docker's default iptables=true inserts ACCEPT rules into the FORWARD chain
     that bypass UFW entirely for containers published on 0.0.0.0. Setting
     iptables=false prevents Docker from touching iptables at all.
+
+    We also ensure default-address-pools is present to avoid:
+      "all predefined address pools have been fully subnetted"
+    on hosts that create many Compose networks over time.
 
     Our compose files bind service ports to 127.0.0.1 and use a regular bridge
     network for container-to-container traffic, so there is no functional impact
@@ -231,8 +402,6 @@ def ensure_docker_daemon_hardening() -> None:
     from tqdm import tqdm
 
     daemon_path = Path("/etc/docker/daemon.json")
-    desired: dict = {"iptables": False}
-
     current: dict = {}
     if daemon_path.exists():
         try:
@@ -240,17 +409,26 @@ def ensure_docker_daemon_hardening() -> None:
         except Exception:
             pass
 
-    merged = {**current, **desired}
+    occupied = _host_ipv4_routes(include_docker_interfaces=False) + [subnet for _, subnet in _docker_bridge_subnets()]
+    default_pools = _choose_default_address_pools(occupied)
+
+    merged = dict(current)
+    merged["iptables"] = False
+    if not merged.get("default-address-pools"):
+        merged["default-address-pools"] = default_pools
+
     if merged == current:
-        tqdm.write("[DOCKER] daemon.json already hardened (iptables=false).")
-        log_line("[DOCKER] daemon.json already contains iptables=false.")
+        tqdm.write("[DOCKER] daemon.json already hardened (iptables=false, address pools configured).")
+        log_line("[DOCKER] daemon.json already hardened (iptables=false, default-address-pools set).")
+        _fail_on_bridge_route_conflicts()
         return
 
     backup_file(daemon_path)
     write_file(daemon_path, json.dumps(merged, indent=2) + "\n", mode=0o644)
-    tqdm.write("[DOCKER] Written /etc/docker/daemon.json with iptables=false; restarting Docker.")
-    log_line("[DOCKER] daemon.json updated with iptables=false; restarting Docker.")
+    tqdm.write("[DOCKER] Updated /etc/docker/daemon.json (iptables=false + address pools); restarting Docker.")
+    log_line("[DOCKER] daemon.json updated (iptables=false + default-address-pools); restarting Docker.")
     sh("systemctl restart docker")
+    _fail_on_bridge_route_conflicts()
 
 
 def ensure_docker() -> None:
