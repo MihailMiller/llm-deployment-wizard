@@ -22,7 +22,7 @@ from __future__ import annotations
 from pathlib import Path
 from shlex import quote
 
-from llama_deploy.config import AccessProfile, AuthMode, Config, ModelSpec
+from llama_deploy.config import AccessProfile, AuthMode, Config, DockerNetworkMode, ModelSpec
 from llama_deploy.log import sh
 from llama_deploy.system import write_file
 
@@ -173,13 +173,38 @@ def _effective_bind_host(cfg: Config) -> str:
     return net.bind_host
 
 
+def _network_mode_block(cfg: Config) -> str:
+    if cfg.docker_network_mode == DockerNetworkMode.COMPOSE:
+        return ""
+    return f"    network_mode: {cfg.docker_network_mode.value}\n"
+
+
+def _llama_bind_host(cfg: Config) -> str:
+    """
+    Host passed to llama-server inside the container.
+
+    In host mode, the process binds directly on the host namespace, so we must
+    respect cfg.network.bind_host. In bridge/compose mode, container-local
+    0.0.0.0 is correct and external exposure is controlled by port mappings.
+    """
+    if cfg.docker_network_mode == DockerNetworkMode.HOST:
+        return cfg.network.bind_host
+    return "0.0.0.0"
+
+
 def _write_compose_plaintext(compose_path: Path, cfg: Config) -> None:
     """Plaintext mode: llama-server owns auth via --api-key-file."""
     net = cfg.network
-    effective_host = _effective_bind_host(cfg)
+    effective_host = (
+        _effective_bind_host(cfg)
+        if cfg.docker_network_mode != DockerNetworkMode.HOST
+        else net.bind_host
+    )
+    network_mode_block = _network_mode_block(cfg)
+    bind_host = _llama_bind_host(cfg)
     ports_block = (
         f'    ports:\n      - "{effective_host}:{net.port}:8080"\n'
-        if net.publish
+        if net.publish and cfg.docker_network_mode != DockerNetworkMode.HOST
         else ""
     )
     content = f"""services:
@@ -187,6 +212,7 @@ def _write_compose_plaintext(compose_path: Path, cfg: Config) -> None:
     image: {cfg.image}
     container_name: llama-router
     restart: unless-stopped
+{network_mode_block}
 
 {ports_block}    volumes:
       - {cfg.base_dir}/models:/models:ro
@@ -195,7 +221,7 @@ def _write_compose_plaintext(compose_path: Path, cfg: Config) -> None:
       - {cfg.base_dir}/secrets:/run/secrets:ro
 
     command: >
-      --host 0.0.0.0
+      --host {bind_host}
       --port 8080
       --api-key-file /run/secrets/api_keys
       --models-dir /models
@@ -226,23 +252,33 @@ def _write_compose_hashed(compose_path: Path, cfg: Config) -> None:
     """
     internal_port = cfg.llama_internal_port
     sidecar_port  = cfg.sidecar_port
+    network_mode_block = _network_mode_block(cfg)
+    bind_host = _llama_bind_host(cfg)
+    llama_ports_block = (
+        f'    ports:\n      - "127.0.0.1:{internal_port}:8080"\n\n'
+        if cfg.docker_network_mode != DockerNetworkMode.HOST
+        else ""
+    )
+    sidecar_ports_block = (
+        f'    ports:\n      - "127.0.0.1:{sidecar_port}:9000"\n\n'
+        if cfg.docker_network_mode != DockerNetworkMode.HOST
+        else ""
+    )
 
     content = f"""services:
   llama:
     image: {cfg.image}
     container_name: llama-router
     restart: unless-stopped
+{network_mode_block}
 
-    ports:
-      - "127.0.0.1:{internal_port}:8080"
-
-    volumes:
+{llama_ports_block}    volumes:
       - {cfg.base_dir}/models:/models:ro
       - {cfg.base_dir}/presets:/presets:ro
       - {cfg.base_dir}/cache:/root/.cache
 
     command: >
-      --host 0.0.0.0
+      --host {bind_host}
       --port 8080
       --models-dir /models
       --models-preset /presets/models.ini
@@ -263,11 +299,9 @@ def _write_compose_hashed(compose_path: Path, cfg: Config) -> None:
     image: python:3.12-slim
     container_name: llama-auth
     restart: unless-stopped
+{network_mode_block}
 
-    ports:
-      - "127.0.0.1:{sidecar_port}:9000"
-
-    volumes:
+{sidecar_ports_block}    volumes:
       - {cfg.base_dir}/auth_sidecar.py:/auth_sidecar.py:ro
       - {cfg.base_dir}/secrets:/run/secrets:ro
 

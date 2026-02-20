@@ -52,6 +52,20 @@ class AccessProfile(str, Enum):
     PUBLIC       = "public"
 
 
+class DockerNetworkMode(str, Enum):
+    """
+    Docker networking strategy for the service containers.
+
+      BRIDGE : use Docker's built-in "bridge" network (no per-project network).
+      COMPOSE: use Docker Compose managed project network (<project>_default).
+      HOST   : share host network namespace (advanced).
+    """
+
+    BRIDGE = "bridge"
+    COMPOSE = "compose"
+    HOST = "host"
+
+
 @dataclass(frozen=True)
 class ModelSpec:
     """
@@ -244,6 +258,18 @@ class Config:
     certbot_email: Optional[str] = None   # email for Let's Encrypt renewal notices
     auth_mode: AuthMode = AuthMode.PLAINTEXT  # token storage strategy
     tailscale_authkey: Optional[str] = None   # auth key for non-interactive tailscale up (vpn-only profile)
+    docker_network_mode: DockerNetworkMode = DockerNetworkMode.BRIDGE  # Docker network mode for containers
+
+    def __post_init__(self) -> None:
+        if self.docker_network_mode == DockerNetworkMode.HOST:
+            if not self.network.publish:
+                raise ValueError(
+                    "docker_network_mode=host cannot be combined with --no-publish."
+                )
+            if self.auth_mode == AuthMode.HASHED:
+                raise ValueError(
+                    "docker_network_mode=host is not supported with --auth-mode hashed."
+                )
 
     # Internal ports used in hashed mode (not user-configurable)
     @property

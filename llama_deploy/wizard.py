@@ -29,6 +29,7 @@ from llama_deploy.config import (
     AuthMode,
     BackendKind,
     Config,
+    DockerNetworkMode,
     ModelSpec,
     NetworkConfig,
 )
@@ -407,9 +408,9 @@ def _step_token() -> Tuple[str, AuthMode]:
     return name or "default", auth_mode
 
 
-def _step_system(access_profile) -> Tuple[int, str, Optional[str]]:
+def _step_system(network: NetworkConfig, auth_mode: AuthMode) -> Tuple[int, str, Optional[str], DockerNetworkMode]:
     """
-    Returns (swap_gib, base_dir, tailscale_authkey_or_None).
+    Returns (swap_gib, base_dir, tailscale_authkey_or_None, docker_network_mode).
 
     tailscale_authkey is only prompted when access_profile == VPN_ONLY.
     """
@@ -417,8 +418,20 @@ def _step_system(access_profile) -> Tuple[int, str, Optional[str]]:
     swap_gib = _prompt_int("Swap file to create if none exists (GiB)", default=8, min_val=0, max_val=256)
     base_dir = _prompt("Base directory for models, config, secrets", default="/opt/llama")
 
+    print()
+    _section("Docker network mode")
+    options: List[Tuple[str, str]] = [
+        ("bridge", "Docker default bridge (recommended)"),
+        ("compose", "Compose-managed project network"),
+    ]
+    if network.publish and auth_mode != AuthMode.HASHED:
+        options.append(("host", "host namespace (advanced)"))
+
+    mode_idx = _choose(options, default=1)
+    docker_network_mode = DockerNetworkMode(options[mode_idx - 1][0])
+
     tailscale_authkey: Optional[str] = None
-    if access_profile == AccessProfile.VPN_ONLY:
+    if network.access_profile == AccessProfile.VPN_ONLY:
         print()
         _section("Tailscale authentication")
         _info("An auth key lets tailscale up run non-interactively.")
@@ -429,7 +442,7 @@ def _step_system(access_profile) -> Tuple[int, str, Optional[str]]:
         if raw_key:
             tailscale_authkey = raw_key
 
-    return swap_gib, base_dir or "/opt/llama", tailscale_authkey
+    return swap_gib, base_dir or "/opt/llama", tailscale_authkey, docker_network_mode
 
 
 # ---------------------------------------------------------------------------
@@ -488,6 +501,7 @@ def _review(cfg: Config) -> None:
         ("LLM",        f"{cfg.llm.effective_alias}  (ctx {cfg.llm.ctx_len})"),
         ("Embedding",  f"{cfg.emb.effective_alias}  (ctx {cfg.emb.ctx_len})"),
         ("Profile",    net.profile_label),
+        ("Docker net", cfg.docker_network_mode.value),
         ("Endpoint",   cfg.public_base_url),
         ("Firewall",   "UFW enabled" if net.configure_ufw else "UFW skipped"),
         ("Token name", f'"{cfg.api_token_name}"'),
@@ -527,7 +541,7 @@ def run_wizard() -> Config:
     llm_spec, emb_spec  = _step_models()
     network, domain, certbot_email = _step_network()
     token_name, auth_mode = _step_token()
-    swap_gib, base_dir_str, tailscale_authkey = _step_system(network.access_profile)
+    swap_gib, base_dir_str, tailscale_authkey, docker_network_mode = _step_system(network, auth_mode)
 
     from pathlib import Path
     cfg = Config(
@@ -549,6 +563,7 @@ def run_wizard() -> Config:
         certbot_email=certbot_email,
         auth_mode=auth_mode,
         tailscale_authkey=tailscale_authkey,
+        docker_network_mode=docker_network_mode,
     )
 
     _review(cfg)

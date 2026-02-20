@@ -34,7 +34,15 @@ import json
 from pathlib import Path
 from typing import List, Optional
 
-from llama_deploy.config import AccessProfile, AuthMode, BackendKind, Config, ModelSpec, NetworkConfig
+from llama_deploy.config import (
+    AccessProfile,
+    AuthMode,
+    BackendKind,
+    Config,
+    DockerNetworkMode,
+    ModelSpec,
+    NetworkConfig,
+)
 
 _DEFAULT_LLM_CANDIDATES = "Q4_K_M,Q5_K_M,Q4_0,Q3_K_M"
 _DEFAULT_EMB_CANDIDATES = "Q8_0,F16,Q6_K,Q4_K_M"
@@ -92,6 +100,11 @@ def build_config(argv: Optional[List[str]] = None) -> Config:
                    help="Open --port in UFW. Requires --bind 0.0.0.0.")
     g.add_argument("--skip-ufw", action="store_true",
                    help="Do not configure UFW at all.")
+    g.add_argument("--docker-network-mode",
+                   default="bridge",
+                   choices=[m.value for m in DockerNetworkMode],
+                   metavar="MODE",
+                   help="Container network mode: bridge (default), compose, or host.")
 
     g = parser.add_argument_group("System")
     g.add_argument("--swap-gib", type=int, default=8, metavar="GIB",
@@ -187,6 +200,10 @@ def build_config(argv: Optional[List[str]] = None) -> Config:
         parser.error("--profile=home-private requires --lan-cidr (e.g. 192.168.1.0/24).")
     if raw.lan_cidr and profile != AccessProfile.HOME_PRIVATE:
         parser.error("--lan-cidr is only valid with --profile=home-private.")
+    if raw.docker_network_mode == DockerNetworkMode.HOST.value and raw.no_publish:
+        parser.error("--docker-network-mode=host cannot be combined with --no-publish.")
+    if raw.docker_network_mode == DockerNetworkMode.HOST.value and raw.auth_mode == AuthMode.HASHED.value:
+        parser.error("--docker-network-mode=host is not supported with --auth-mode hashed.")
 
     hf_token: Optional[str] = raw.hf_token or os.environ.get("HF_TOKEN") or None
     tailscale_authkey: Optional[str] = (
@@ -235,6 +252,7 @@ def build_config(argv: Optional[List[str]] = None) -> Config:
         certbot_email=raw.certbot_email or None,
         auth_mode=AuthMode(raw.auth_mode),
         tailscale_authkey=tailscale_authkey,
+        docker_network_mode=DockerNetworkMode(raw.docker_network_mode),
     )
 
 

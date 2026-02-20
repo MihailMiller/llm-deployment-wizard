@@ -208,6 +208,9 @@ Network:
   --no-publish          Do NOT publish any host port (Docker-network-only).
   --open-firewall       Open --port in UFW. Requires --bind 0.0.0.0.
   --skip-ufw            Do not configure UFW at all.
+  --docker-network-mode MODE
+                        Container network mode: bridge (default), compose, or host.
+                        host is advanced and not supported with --auth-mode hashed.
 
 System:
   --swap-gib GIB        Swap file size if none exists. (default: 8)
@@ -781,7 +784,8 @@ The wizard requires an interactive terminal (TTY). Use a real SSH session, not a
 Reload your shell or log out and back in: `exec bash -l`. Docker was just installed; the PATH needs refreshing.
 
 **`failed to create network ... all predefined address pools have been fully subnetted`.**
-Your Docker host ran out of bridge subnets. `llama_deploy` now configures non-overlapping `default-address-pools` automatically, but existing conflicting Docker bridges can still break routing (for example overlapping with LAN/VPN ranges like `172.22.0.0/16`).
+If you use `--docker-network-mode compose`, Docker Compose creates project networks and the host can run out of subnets.
+Use `--docker-network-mode bridge` (default) to avoid per-project network creation.
 
 Prune unused bridge networks, then retry:
 ```bash

@@ -700,16 +700,57 @@ def run_deploy(cfg) -> None:
             lambda: curl_smoke_tests(loopback_url, token_step.result.value, llm_step.result, emb_step.result),
         )
     else:
-        project  = cfg.base_dir.name
-        net_name = f"{project}_default"
-
         def _internal_test() -> None:
+            from llama_deploy.config import DockerNetworkMode
             from llama_deploy.log import sh
             sh("docker pull curlimages/curl:8.5.0", check=False)
+            if cfg.docker_network_mode == DockerNetworkMode.BRIDGE:
+                # In bridge mode, target the container's bridge IP.
+                router_target = (
+                    subprocess.check_output(
+                        [
+                            "docker",
+                            "inspect",
+                            "-f",
+                            "{{range.NetworkSettings.Networks}}{{.IPAddress}}{{end}}",
+                            "llama-router",
+                        ],
+                        text=True,
+                    )
+                    .strip()
+                )
+                if not router_target:
+                    raise RuntimeError("Could not determine llama-router bridge IP for internal smoke test.")
+                runner_network = "bridge"
+            elif cfg.docker_network_mode == DockerNetworkMode.COMPOSE:
+                # In compose mode, use the project network and service DNS name.
+                runner_network = (
+                    subprocess.check_output(
+                        [
+                            "docker",
+                            "inspect",
+                            "-f",
+                            "{{range $k, $v := .NetworkSettings.Networks}}{{$k}}{{\"\\n\"}}{{end}}",
+                            "llama-router",
+                        ],
+                        text=True,
+                    )
+                    .splitlines()[0]
+                    .strip()
+                )
+                if not runner_network:
+                    raise RuntimeError("Could not determine compose network for internal smoke test.")
+                router_target = "llama-router"
+            else:
+                raise RuntimeError(
+                    "Internal no-publish smoke test is unsupported for docker_network_mode="
+                    f"{cfg.docker_network_mode.value}."
+                )
+
             sh(
-                f"docker run --rm --network {net_name} curlimages/curl:8.5.0 "
-                f"sh -lc \"curl -fsS http://llama-router:8080/health && "
-                f"curl -fsS http://llama-router:8080/v1/models "
+                f"docker run --rm --network {runner_network} curlimages/curl:8.5.0 "
+                f"sh -lc \"curl -fsS http://{router_target}:8080/health && "
+                f"curl -fsS http://{router_target}:8080/v1/models "
                 f"-H 'Authorization: Bearer {token_step.result.value}' | head -c 800\""
             )
 
