@@ -51,7 +51,9 @@ def write_models_ini(
     # Keep implicit/local presets off by default so startup count is fully
     # controlled by explicit model sections below (important for models_max=1).
     global_startup = "false"
-    llm_startup = "true" if models_max >= 1 else "false"
+    # With models_max=1 we avoid preloading both model families and let router
+    # autoload on demand to stay within the startup cap.
+    llm_startup = "true" if models_max >= 2 else "false"
     emb_startup = "true" if models_max >= 2 else "false"
 
     content = f"""version = 1
@@ -232,7 +234,6 @@ def _write_compose_plaintext(compose_path: Path, cfg: Config) -> None:
       --host {bind_host}
       --port 8080
       --api-key-file /run/secrets/api_keys
-      --models-dir /models
       --models-preset /presets/models.ini
       --models-max {cfg.models_max}
       --no-webui
@@ -290,7 +291,6 @@ def _write_compose_hashed(compose_path: Path, cfg: Config) -> None:
     command: >
       --host {bind_host}
       --port 8080
-      --models-dir /models
       --models-preset /presets/models.ini
       --models-max {cfg.models_max}
       --no-webui
