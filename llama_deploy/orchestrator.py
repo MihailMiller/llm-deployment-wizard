@@ -726,9 +726,18 @@ def run_deploy(cfg) -> None:
         return cfg.network.base_url
 
     if cfg.network.publish or cfg.auth_mode == AuthMode.HASHED:
+        if cfg.auth_mode == AuthMode.HASHED:
+            health_fn = lambda: wait_health(
+                f"{_loopback_url()}/health",
+                timeout_s=300,
+                bearer_token=token_step.result.value,
+            )
+        else:
+            health_fn = lambda: wait_health(f"{_loopback_url()}/health", timeout_s=300)
+
         health_step = Step(
             "Wait for /health",
-            lambda: wait_health(f"{_loopback_url()}/health", timeout_s=300),
+            health_fn,
         )
         smoke_step = Step(
             "Smoke tests (OpenAI-compatible routes)",

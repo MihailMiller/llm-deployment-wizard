@@ -9,13 +9,14 @@ from __future__ import annotations
 
 import json
 import time
+import urllib.error
 import urllib.request
 
 from llama_deploy.config import ModelSpec
 from llama_deploy.log import die, log_line, sh
 
 
-def wait_health(url: str, timeout_s: int = 300) -> None:
+def wait_health(url: str, timeout_s: int = 300, bearer_token: str | None = None) -> None:
     """
     Poll /health until it returns HTTP 200 or the deadline expires.
 
@@ -41,11 +42,15 @@ def wait_health(url: str, timeout_s: int = 300) -> None:
         while time.time() < deadline:
             try:
                 req = urllib.request.Request(url)
+                if bearer_token:
+                    req.add_header("Authorization", f"Bearer {bearer_token}")
                 with urllib.request.urlopen(req, timeout=3) as resp:
                     if resp.status == 200:
                         tqdm.write("[OK] /health returned 200")
                         log_line("[OK] /health returned 200")
                         return
+            except urllib.error.HTTPError:
+                pass
             except Exception:
                 pass
 
