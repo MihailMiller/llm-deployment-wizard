@@ -446,25 +446,14 @@ def _step_token() -> Tuple[str, AuthMode]:
     print()
     name = _prompt("Token name", default="default")
 
-    _section("Token storage")
-    _info("Plaintext: llama-server compares tokens directly — simpler, no extra services.")
-    _info("Hashed:    only SHA-256 hashes stored; plaintext never written to disk.")
-    _info("           NGINX is installed as an auth proxy (required for hashed mode).")
-    print()
-    options = [
-        ("Plaintext", "simpler — works with all network modes"),
-        ("Hashed",    "more secure — NGINX auth_request + sidecar; instant revocation"),
-    ]
-    idx = _choose(options, default=1)
-    auth_mode = AuthMode.PLAINTEXT if idx == 1 else AuthMode.HASHED
-
-    if auth_mode == AuthMode.HASHED:
-        _info("NGINX will be installed and configured as a local auth-enforcing proxy.")
+    auth_mode = AuthMode.HASHED
+    _info("Token storage: hashed — only SHA-256 stored; plaintext never written to disk.")
+    _info("NGINX will be installed and configured as a local auth-enforcing proxy.")
 
     return name or "default", auth_mode
 
 
-def _step_system(network: NetworkConfig, auth_mode: AuthMode) -> Tuple[int, str, Optional[str], DockerNetworkMode]:
+def _step_system(network: NetworkConfig) -> Tuple[int, str, Optional[str], DockerNetworkMode]:
     """
     Returns (swap_gib, base_dir, tailscale_authkey_or_None, docker_network_mode).
 
@@ -480,8 +469,6 @@ def _step_system(network: NetworkConfig, auth_mode: AuthMode) -> Tuple[int, str,
         ("bridge", "Docker default bridge (recommended)"),
         ("compose", "Compose-managed project network"),
     ]
-    if network.publish and auth_mode != AuthMode.HASHED:
-        options.append(("host", "host namespace (advanced)"))
 
     mode_idx = _choose(options, default=1)
     docker_network_mode = DockerNetworkMode(options[mode_idx - 1][0])
@@ -598,7 +585,7 @@ def run_wizard() -> Config:
     network, domain, certbot_email = _step_network()
     token_name, auth_mode = _step_token()
     network = _commit_local_hashed_proxy_port(network, auth_mode, domain)
-    swap_gib, base_dir_str, tailscale_authkey, docker_network_mode = _step_system(network, auth_mode)
+    swap_gib, base_dir_str, tailscale_authkey, docker_network_mode = _step_system(network)
 
     from pathlib import Path
     cfg = Config(
