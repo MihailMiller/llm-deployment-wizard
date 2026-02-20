@@ -627,7 +627,7 @@ def run_deploy(cfg) -> None:
     # Phase 3: Service configuration and startup
     # -----------------------------------------------------------------------
     def _write_config() -> None:
-        write_models_ini(cfg.preset_path, llm_step.result, emb_step.result, cfg.parallel)
+        write_models_ini(cfg.preset_path, llm_step.result, emb_step.result, cfg.parallel, cfg.models_max)
         write_compose(cfg.compose_path, cfg)
         if cfg.auth_mode == AuthMode.HASHED:
             write_auth_sidecar_script(cfg.base_dir)

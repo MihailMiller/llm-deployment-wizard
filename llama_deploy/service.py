@@ -37,6 +37,7 @@ def write_models_ini(
     llm: ModelSpec,
     emb: ModelSpec,
     parallel: int,
+    models_max: int,
 ) -> None:
     """
     Write the llama-server router preset INI file.
@@ -47,6 +48,8 @@ def write_models_ini(
     """
     assert llm.resolved_filename, "LLM ModelSpec must be resolved before writing INI"
     assert emb.resolved_filename, "Embedding ModelSpec must be resolved before writing INI"
+    llm_startup = "true"
+    emb_startup = "true" if models_max >= 2 else "false"
 
     content = f"""version = 1
 
@@ -57,12 +60,12 @@ c = {llm.ctx_len}
 
 [{llm.effective_alias}]
 model = /models/{llm.resolved_filename}
-load-on-startup = true
+load-on-startup = {llm_startup}
 c = {llm.ctx_len}
 
 [{emb.effective_alias}]
 model = /models/{emb.resolved_filename}
-load-on-startup = true
+load-on-startup = {emb_startup}
 embeddings = true
 pooling = last
 c = {emb.ctx_len}
