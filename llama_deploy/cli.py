@@ -144,10 +144,10 @@ def build_config(argv: Optional[List[str]] = None) -> Config:
                    help="Skip HF queries and downloads if model files are already on disk.")
     g.add_argument("--allow-unverified-downloads", action="store_true",
                    help="Allow continuing when SHA256 cannot be verified; non-interactive trust mode.")
-    g.add_argument("--skip-health-check", action="store_true",
-                   help="Skip the /health wait and smoke tests after container start. "
-                        "Useful when the model is slow to load (>5 min) or on re-deploys "
-                        "where the service is already known-good.")
+    g.add_argument("--wait-health-check", action="store_true",
+                   help="Wait for /health and run smoke tests after container start. "
+                        "Skipped by default (large models take >5 min to load). "
+                        "Enable in CI or when you want to verify the service before the summary.")
 
     g = parser.add_argument_group("HTTPS / TLS (NGINX + Let's Encrypt)")
     g.add_argument("--domain", default=None, metavar="DOMAIN",
@@ -257,7 +257,7 @@ def build_config(argv: Optional[List[str]] = None) -> Config:
         emb=emb_spec,
         auto_optimize=not raw.no_auto_optimize,
         allow_unverified_downloads=raw.allow_unverified_downloads,
-        skip_health_check=raw.skip_health_check,
+        skip_health_check=not raw.wait_health_check,
         domain=domain,
         certbot_email=raw.certbot_email or None,
         auth_mode=AuthMode(raw.auth_mode),

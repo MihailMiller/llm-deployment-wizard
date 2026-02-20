@@ -292,7 +292,7 @@ class Config:
     emb: ModelSpec
     auto_optimize: bool = True            # tune model/runtime defaults from detected host specs
     allow_unverified_downloads: bool = False  # permit trusting downloads when upstream SHA cannot be proven
-    skip_health_check: bool = False       # skip /health wait + smoke tests (useful when model is slow to load)
+    skip_health_check: bool = True        # skip /health wait + smoke tests by default; opt-in via --wait-health-check
     domain: Optional[str] = None          # public domain for NGINX + Let's Encrypt TLS
     certbot_email: Optional[str] = None   # email for Let's Encrypt renewal notices
     auth_mode: AuthMode = AuthMode.PLAINTEXT  # token storage strategy
