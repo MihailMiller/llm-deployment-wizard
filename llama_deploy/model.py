@@ -29,6 +29,13 @@ _METADATA_FALLBACK_REPOS = {
     # Some mirrors expose LFS metadata even when the upstream repo does not.
     "Qwen/Qwen3-8B-GGUF": "Aldaris/Qwen3-8B-Q4_K_M-GGUF",
 }
+_KNOWN_INCONSISTENT_API_SHA_REPOS = {
+    # These repos can expose API sha256 values that do not match bytes served
+    # from pinned /resolve URLs. If resolve headers don't provide checksum,
+    # we downgrade to size-based validation instead of hard SHA checks.
+    "Qwen/Qwen3-8B-GGUF",
+    "unsloth/Ministral-3-14B-Instruct-2512-GGUF",
+}
 _SHA256_RE = re.compile(r"^[0-9a-fA-F]{64}$")
 
 
@@ -245,7 +252,7 @@ def download_hf_file(
                 return got, got_size
         elif expected_size is not None and got_size == expected_size:
             tqdm.write(f"[OK] {dst.name} exists and size matches.")
-            tqdm.write(f"[WARN] Upstream sha256 unavailable; using local sha256={got}.")
+            tqdm.write(f"[INFO] Upstream sha256 unavailable; using local sha256={got}.")
             return got, got_size
         elif expected_size is None:
             tqdm.write(f"[WARN] Upstream sha256/size unavailable; reusing existing {dst.name}.")
@@ -325,6 +332,7 @@ def download_hf_file(
         die(f"Size mismatch for {dst.name}. Expected {expected_size}, got {got_size} bytes.")
 
     got_sha = h.hexdigest()
+    trusted_unverified = False
     if expected_sha256 and got_sha.lower() != expected_sha256.lower():
         _, probe_sha = probe_hf_resolve_metadata(repo, revision, filename, hf_token)
         if probe_sha and got_sha.lower() == probe_sha.lower():
@@ -352,16 +360,25 @@ def download_hf_file(
                     f"Expected: {expected_sha256}\n"
                     f"Got:      {got_sha}"
                 )
+            trusted_unverified = True
 
     import os
     part.replace(dst)
     os.chmod(dst, 0o644)
-    if expected_sha256:
-        tqdm.write(f"[OK] Downloaded {dst.name}, sha256 verified.")
+    if expected_sha256 and not trusted_unverified:
+        tqdm.write(f"[OK] Downloaded {dst.name} — sha256 verified ({got_sha[:12]}...).")
+        log_line(f"[OK] sha256 verified for {dst.name}: {got_sha}")
+    elif expected_sha256 and trusted_unverified:
+        # Never print [OK] after a trust-override — this was the source of
+        # misleading "sha256 verified" messages in the original code path.
+        tqdm.write(f"[WARN] Downloaded {dst.name} — checksum mismatch accepted by trust.")
+        tqdm.write(f"[WARN] Local sha256={got_sha}  (expected={expected_sha256})")
+        log_line(f"[WARN] Trust-override accepted for {dst.name}: local={got_sha} expected={expected_sha256}")
     else:
-        tqdm.write(f"[OK] Downloaded {dst.name}.")
-        tqdm.write(f"[WARN] Upstream sha256 unavailable; local sha256={got_sha}")
-    return got_sha, got_size
+        tqdm.write(f"[WARN] Downloaded {dst.name} — upstream sha256 unavailable; NOT verified.")
+        tqdm.write(f"[WARN] Local sha256 for reference: {got_sha}")
+        log_line(f"[WARN] sha256 unavailable for {dst.name}: local={got_sha}")
+    return got_sha, got_size, trusted_unverified
 
 
 # ---------------------------------------------------------------------------
@@ -409,6 +426,12 @@ def resolve_model(
                     f"({probed_sha[:12]}...); using resolve header."
                 )
             sha256 = probed_sha
+        elif repo in _KNOWN_INCONSISTENT_API_SHA_REPOS and sha256 is not None:
+            tqdm.write(
+                f"[WARN] Ignoring HF API sha256 for {repo}; "
+                "resolve headers did not provide checksum for this known-inconsistent repo."
+            )
+            sha256 = None
         return filename, size, sha256, revision
 
     resolved_repo = spec.hf_repo
@@ -458,25 +481,31 @@ def resolve_model(
     if size is None:
         tqdm.write(f"[WARN] Size unavailable for {filename}; progress may not show total bytes.")
     if sha256 is None:
-        if not _confirm_trust_unverified(
-            repo=resolved_repo,
-            revision=revision,
-            filename=filename,
-            reason=f"No sha256 metadata is available for {filename}.",
-            allow_unverified_downloads=allow_unverified_downloads,
-        ):
-            die(
-                f"Refusing unverified download for {filename}. "
-                "Approve trust interactively or re-run with --allow-unverified-downloads."
+        if resolved_repo in _KNOWN_INCONSISTENT_API_SHA_REPOS and size is not None:
+            tqdm.write(
+                f"[WARN] sha256 unavailable for {filename}; "
+                "proceeding with size-based validation for known-inconsistent repo."
             )
-        tqdm.write(f"[WARN] sha256 unavailable for {filename}; proceeding by user trust.")
+        else:
+            if not _confirm_trust_unverified(
+                repo=resolved_repo,
+                revision=revision,
+                filename=filename,
+                reason=f"No sha256 metadata is available for {filename}.",
+                allow_unverified_downloads=allow_unverified_downloads,
+            ):
+                die(
+                    f"Refusing unverified download for {filename}. "
+                    "Approve trust interactively or re-run with --allow-unverified-downloads."
+                )
+            tqdm.write(f"[WARN] sha256 unavailable for {filename}; proceeding by user trust.")
 
     size_txt = f"{size / 1e9:.2f} GB" if size is not None else "size=?"
     sha_txt = f"{sha256[:12]}..." if sha256 else "sha256=?"
     tqdm.write(f"[HF] Resolved from {resolved_repo}@{revision[:12]}: {filename} ({size_txt}, {sha_txt})")
 
     dst = dst_dir / filename
-    local_sha, local_size = download_hf_file(
+    local_sha, local_size, trust_overridden = download_hf_file(
         resolved_repo,
         revision,
         filename,
@@ -487,4 +516,9 @@ def resolve_model(
         allow_unverified_downloads=allow_unverified_downloads,
     )
 
-    return spec.with_resolved(filename=filename, sha256=local_sha, size=local_size)
+    return spec.with_resolved(
+        filename=filename,
+        sha256=local_sha,
+        size=local_size,
+        trust_overridden=trust_overridden,
+    )

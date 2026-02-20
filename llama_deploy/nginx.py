@@ -31,6 +31,7 @@ LLM-specific proxy settings
 from __future__ import annotations
 
 from pathlib import Path
+from shlex import quote
 
 from llama_deploy.log import log_line, sh
 
@@ -259,8 +260,8 @@ def obtain_certificate(domain: str, email: str) -> None:
         f"--non-interactive "
         f"--agree-tos "
         f"--redirect "
-        f"-m {email} "
-        f"-d {domain}"
+        f"-m {quote(email)} "
+        f"-d {quote(domain)}"
     )
     # Verify the auto-renewal timer is active
     sh("systemctl is-active certbot.timer || systemctl enable --now certbot.timer", check=False)

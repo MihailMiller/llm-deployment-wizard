@@ -1,0 +1,161 @@
+name: CD — Deploy to VM
+
+# Triggers:
+#   push to main      → code-only redeploy (--skip-download, no model re-fetch)
+#   workflow_dispatch → manual trigger:
+#       skip_download=true  (default) → code change only
+#       skip_download=false           → also pull new/updated models from HF
+#                                       (first deploy OR model version change)
+#
+# ALL secrets (HF_TOKEN, VM credentials, etc.) come from GitHub Secrets —
+# no credentials are ever written into this file or run manually on the VM.
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      skip_download:
+        description: >
+          Skip model re-download.
+          Set to false for first deploy or when changing --llm-repo / --emb-repo.
+          WARNING: downloading takes 30+ minutes.
+        type: boolean
+        default: true
+      dry_run:
+        description: >
+          Echo the deploy command on the VM without executing it.
+          Use to verify secrets and flags before a real run.
+        type: boolean
+        default: false
+
+# Serialise deploys: never run two at once; let the in-progress one finish.
+concurrency:
+  group: deploy-vm
+  cancel-in-progress: false
+
+jobs:
+  # -------------------------------------------------------------------------
+  # Gate: full CI suite must pass before anything hits the VM
+  # -------------------------------------------------------------------------
+  ci:
+    uses: ./.github/workflows/ci.yml   # requires workflow_call in ci.yml
+
+  # -------------------------------------------------------------------------
+  # Deploy
+  # -------------------------------------------------------------------------
+  deploy:
+    needs: ci
+    runs-on: ubuntu-latest
+
+    # Pause here for a required reviewer before touching the VM.
+    # Create a GitHub Environment named "production" (Settings → Environments)
+    # and add protection rules / required reviewers there.
+    environment: production
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # --------------------------------------------------------------------
+      # Resolve --skip-download flag
+      # push to main  → always skip (models already on disk)
+      # workflow_dispatch → honour the input (false = re-download models)
+      # --------------------------------------------------------------------
+      - name: Resolve deploy flags
+        id: flags
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            SKIP="${{ inputs.skip_download }}"
+          else
+            SKIP="true"
+          fi
+          [ "$SKIP" = "true" ] \
+            && echo "skip_flag=--skip-download" >> "$GITHUB_OUTPUT" \
+            || echo "skip_flag="               >> "$GITHUB_OUTPUT"
+          echo "skip_download resolved to: $SKIP"
+
+      # --------------------------------------------------------------------
+      # Sync code on VM then run the idempotent deployer
+      #
+      # Secret passthrough through sudo
+      # --------------------------------
+      # appleboy/ssh-action sets HF_TOKEN and TAILSCALE_AUTHKEY in the remote
+      # shell session via AcceptEnv (configured in sshd_config on the VM, or
+      # forwarded via the `envs:` parameter below which injects them as shell
+      # exports before the script runs).
+      #
+      # sudo strips env by default. The sudoers stanza:
+      #   Defaults:deployer env_keep += "HF_TOKEN TAILSCALE_AUTHKEY"
+      # tells sudo to preserve exactly these two vars from the deployer
+      # session into the root process, without granting -E (full env dump).
+      #
+      # require_root_reexec() in system.py sees geteuid()==0 after sudo and
+      # returns immediately — it never needs to re-exec in CD mode.
+      # --------------------------------------------------------------------
+      - name: Sync code and deploy
+        uses: appleboy/ssh-action@v1.2.0
+        env:
+          HF_TOKEN:          ${{ secrets.HF_TOKEN }}
+          TAILSCALE_AUTHKEY: ${{ secrets.TAILSCALE_AUTHKEY }}
+          SKIP_FLAG:         ${{ steps.flags.outputs.skip_flag }}
+          DRY_RUN:           ${{ inputs.dry_run || 'false' }}
+        with:
+          host:     ${{ secrets.VM_HOST }}
+          port:     ${{ secrets.VM_PORT }}
+          username: ${{ secrets.VM_USER }}
+          key:      ${{ secrets.VM_SSH_KEY }}
+          envs:     HF_TOKEN,TAILSCALE_AUTHKEY,SKIP_FLAG,DRY_RUN
+          script: |
+            set -euo pipefail
+
+            REPO=/opt/llama_deploy
+            BASE=/opt/llama
+
+            echo "=== Syncing code to $(git -C "$REPO" rev-parse HEAD) ==="
+            git -C "$REPO" fetch --quiet origin main
+            git -C "$REPO" reset --hard origin/main
+            echo "Code now at: $(git -C "$REPO" rev-parse --short HEAD)"
+
+            echo "=== Deploy flags: SKIP_FLAG='$SKIP_FLAG' DRY_RUN='$DRY_RUN' ==="
+
+            if [ "$DRY_RUN" = "true" ]; then
+              echo "dry-run — would execute:"
+              echo "  sudo python3 -m llama_deploy deploy --batch"
+              echo "    --base-dir $BASE"
+              echo "    --profile vpn-only"
+              echo "    --port 8080"
+              echo "    --token-name company-service"
+              echo "    $SKIP_FLAG"
+              exit 0
+            fi
+
+            echo "=== Running deploy ==="
+            # HF_TOKEN and TAILSCALE_AUTHKEY survive sudo via env_keep (see
+            # sudoers setup in VM prerequisites). The deployer sudoers rule
+            # grants NOPASSWD only for this exact command prefix.
+            sudo python3 -m llama_deploy deploy --batch \
+              --base-dir "$BASE"             \
+              --profile  vpn-only            \
+              --port     8080                \
+              --token-name company-service   \
+              $SKIP_FLAG
+
+      # --------------------------------------------------------------------
+      # Smoke test: SSH back in and hit /health from inside the VM.
+      # This works regardless of whether the runner has Tailscale access.
+      # --------------------------------------------------------------------
+      - name: Smoke test — /health via loopback
+        if: ${{ inputs.dry_run != 'true' }}
+        uses: appleboy/ssh-action@v1.2.0
+        with:
+          host:     ${{ secrets.VM_HOST }}
+          port:     ${{ secrets.VM_PORT }}
+          username: ${{ secrets.VM_USER }}
+          key:      ${{ secrets.VM_SSH_KEY }}
+          script: |
+            set -euo pipefail
+            echo "Waiting 15 s for container to become healthy..."
+            sleep 15
+            curl -fsS --max-time 10 http://127.0.0.1:8080/health
+            echo ""
+            echo "Smoke test passed."

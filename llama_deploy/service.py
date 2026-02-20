@@ -19,10 +19,12 @@ Two compose layouts are generated depending on cfg.auth_mode:
 
 from __future__ import annotations
 
+import subprocess
 from pathlib import Path
+from shlex import quote
 
-from llama_deploy.config import AuthMode, Config, ModelSpec
-from llama_deploy.log import sh
+from llama_deploy.config import AccessProfile, AuthMode, Config, ModelSpec
+from llama_deploy.log import log_line, sh
 from llama_deploy.system import write_file
 
 
@@ -143,11 +145,41 @@ def write_compose(compose_path: Path, cfg: Config) -> None:
         _write_compose_plaintext(compose_path, cfg)
 
 
+def _effective_bind_host(cfg: Config) -> str:
+    """
+    Return the host address that should appear in the Docker port mapping.
+
+    For profiles that should never expose the backend directly (HOME_PRIVATE,
+    VPN_ONLY, LOCALHOST) we always pin to 127.0.0.1 even if bind_host is
+    "0.0.0.0".  In those profiles the host-level firewall (UFW) or VPN layer
+    controls external access; Docker must not punch through on its own.
+
+    PUBLIC is the only profile that may legitimately bind to 0.0.0.0 (when no
+    NGINX domain is configured and open_firewall is True).
+    """
+    from llama_deploy.log import log_line
+
+    net = cfg.network
+    if net.access_profile in (
+        AccessProfile.HOME_PRIVATE,
+        AccessProfile.VPN_ONLY,
+        AccessProfile.LOCALHOST,
+    ) and net.bind_host == "0.0.0.0":
+        log_line(
+            f"[COMPOSE] Profile={net.access_profile.value}: "
+            f"overriding Docker bind from 0.0.0.0 -> 127.0.0.1 "
+            f"(external access via UFW/VPN, not Docker port mapping)."
+        )
+        return "127.0.0.1"
+    return net.bind_host
+
+
 def _write_compose_plaintext(compose_path: Path, cfg: Config) -> None:
     """Plaintext mode: llama-server owns auth via --api-key-file."""
     net = cfg.network
+    effective_host = _effective_bind_host(cfg)
     ports_block = (
-        f'    ports:\n      - "{net.bind_host}:{net.port}:8080"\n'
+        f'    ports:\n      - "{effective_host}:{net.port}:8080"\n'
         if net.publish
         else ""
     )
@@ -183,11 +215,10 @@ def _write_compose_plaintext(compose_path: Path, cfg: Config) -> None:
       - /tmp:rw,noexec,nosuid,size=256m
 
     networks:
-      - llm_internal
+      - appnet
 
 networks:
-  llm_internal:
-    internal: true
+  appnet: {{}}
 """
     write_file(compose_path, content, mode=0o644)
 
@@ -236,7 +267,7 @@ def _write_compose_hashed(compose_path: Path, cfg: Config) -> None:
       - /tmp:rw,noexec,nosuid,size=256m
 
     networks:
-      - llm_internal
+      - appnet
 
   llama-auth:
     image: python:3.12-slim
@@ -266,11 +297,10 @@ def _write_compose_hashed(compose_path: Path, cfg: Config) -> None:
       - /tmp:rw,noexec,nosuid,size=32m
 
     networks:
-      - llm_internal
+      - appnet
 
 networks:
-  llm_internal:
-    internal: true
+  appnet: {{}}
 """
     write_file(compose_path, content, mode=0o644)
 
@@ -280,12 +310,22 @@ networks:
 # ---------------------------------------------------------------------------
 
 def docker_pull(image: str) -> None:
-    sh(f"docker pull {image}")
+    sh(f"docker pull {quote(image)}")
 
 
 def docker_compose_up(compose_path: Path) -> None:
-    sh(f"cd {compose_path.parent} && docker compose up -d")
+    log_line(f"\n$ cd {compose_path.parent} && docker compose up -d")
+    subprocess.run(
+        ["docker", "compose", "up", "-d"],
+        cwd=compose_path.parent,
+        check=True,
+    )
 
 
 def docker_compose_down(compose_path: Path) -> None:
-    sh(f"cd {compose_path.parent} && docker compose down", check=False)
+    log_line(f"\n$ cd {compose_path.parent} && docker compose down")
+    subprocess.run(
+        ["docker", "compose", "down"],
+        cwd=compose_path.parent,
+        check=False,
+    )

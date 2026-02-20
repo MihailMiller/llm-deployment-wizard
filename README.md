@@ -10,6 +10,15 @@ GET  /v1/models
 
 The server runs inside Docker, is bound to localhost by default, uses a hardened read-only container, and is never exposed to the internet unless you explicitly choose it.
 
+**Access profiles** let you deploy for different use cases without needing to know the underlying UFW/bind details:
+
+| Profile | Who can reach the API | No port-forwarding needed |
+|---|---|---|
+| `localhost` | This machine only (default) | yes |
+| `home-private` | Your LAN (UFW-restricted to a CIDR) | yes |
+| `vpn-only` | Tailscale network peers | yes |
+| `public` | Internet (NGINX+TLS or direct) | requires open port |
+
 ---
 
 ## What this does
@@ -60,6 +69,7 @@ export HF_TOKEN=hf_your_token_here
 ```
 
 The default models (Ministral-3-14B-Instruct-2512, Qwen3-Embedding-0.6B) are public and do not require a token.
+On low-memory hosts, deployment auto-detects RAM/CPU and can downshift to a smaller LLM profile automatically to reduce OOM risk.
 The wizard includes a larger preset catalog (Qwen, Llama, Mistral, Gemma, Phi, BGE) and can prompt you to switch models and retry if a download fails.
 
 ---
@@ -110,16 +120,15 @@ Choice [1]:
 ║  Step 3/5 · Network                               ║
 ╚════════════════════════════════════════════════════╝
 
-  [1] Localhost only   127.0.0.1 — most secure, for local apps only
-  [2] HTTPS + domain   NGINX + Let's Encrypt — recommended for internet exposure
-  [3] All interfaces   0.0.0.0 — direct exposure without TLS
-  [4] Docker network   no host port — only from other containers
+  Choose who should be able to reach the API:
 
-Choice [1]: 2
+  [1] Localhost only        127.0.0.1 — local apps on this machine only
+  [2] Home / LAN network    LAN CIDR — private network access, UFW-restricted
+  [3] VPN only (Tailscale)  VPN interface — reachable only via Tailscale or other VPN
+  [4] Internet / Public     NGINX + Let's Encrypt TLS — or direct 0.0.0.0
+  [5] Docker internal       no host port — only reachable from other containers
 
-  Domain name (e.g. api.example.com): api.myserver.com
-  Email for Let's Encrypt renewal notices: me@example.com
-  Internal port [8080]:
+Choice [1]:
 ```
 
 After step 5, a review summary is shown and you confirm before anything is written to disk.
@@ -189,8 +198,12 @@ Backend:
                         llama.cpp Docker image variant. (default: cpu)
 
 Network:
-  --bind HOST           Host address to bind the published port to.
-                        Use 0.0.0.0 to expose publicly. (default: 127.0.0.1)
+  --profile PROFILE     Access profile: localhost (default), home-private,
+                        vpn-only, or public. Sets safe bind/firewall defaults.
+  --lan-cidr CIDR       LAN source CIDR for home-private (e.g. 192.168.1.0/24).
+                        Required when --profile=home-private.
+  --bind HOST           Override bind address (inferred from --profile when
+                        omitted). Use 0.0.0.0 for public. (default: 127.0.0.1)
   --port PORT           Host port to publish. (default: 8080)
   --no-publish          Do NOT publish any host port (Docker-network-only).
   --open-firewall       Open --port in UFW. Requires --bind 0.0.0.0.
@@ -198,6 +211,11 @@ Network:
 
 System:
   --swap-gib GIB        Swap file size if none exists. (default: 8)
+  --no-auto-optimize    Disable host-spec auto tuning (model/ctx/memory knobs).
+  --tailscale-authkey KEY
+                        Auth key for non-interactive tailscale up.
+                        Only used with --profile=vpn-only.
+                        Falls back to TAILSCALE_AUTHKEY env var.
 
 Authentication:
   --token TOKEN         API token value. Randomly generated if omitted.
@@ -362,6 +380,125 @@ Chat requests would then use `"model": "bartowski/Mistral-7B-Instruct-v0.3"`.
 
 ---
 
+## Home / LAN network access (no port-forwarding)
+
+Use the `home-private` profile to make the API reachable anywhere on your home LAN without exposing it to the internet. UFW restricts inbound traffic to your LAN CIDR — the Docker container itself stays bound to loopback.
+
+```
+[LAN clients: 192.168.1.x] ──HTTP──► UFW allows ──► 127.0.0.1:8080 (Docker)
+[WAN / internet]            ──HTTP──► UFW blocks
+```
+
+### Via the wizard
+
+Select **[2] Home / LAN network** in Step 3/5 · Network / Access Profile:
+
+```
+  [2] Home / LAN network   LAN CIDR — private network access, UFW-restricted
+
+  LAN CIDR (e.g. 192.168.1.0/24): 192.168.1.0/24
+  Port [8080]:
+```
+
+### Via batch mode
+
+```bash
+sudo python3 -m llama_deploy deploy --batch \
+  --profile home-private \
+  --lan-cidr 192.168.1.0/24 \
+  --port 8080
+```
+
+### Connecting from another LAN device
+
+Use the server's LAN IP (e.g. `192.168.1.10`):
+
+```bash
+curl http://192.168.1.10:8080/v1/models \
+  -H "Authorization: Bearer <token>"
+```
+
+Python OpenAI SDK:
+
+```python
+client = OpenAI(base_url="http://192.168.1.10:8080/v1", api_key="<token>")
+```
+
+### Security notes
+
+- Docker port is bound to `127.0.0.1` — Docker itself does not expose the port to `0.0.0.0`. UFW handles LAN access.
+- LAN CIDR is enforced by UFW: `ufw allow from 192.168.1.0/24 to any port 8080`.
+- No TLS. Consider hashed token mode (`--auth-mode hashed`) if your LAN includes untrusted devices.
+- To verify: `ufw status numbered` — you should see a rule allowing your CIDR and a deny for `8080/tcp` from all else.
+
+---
+
+## VPN-only access via Tailscale (no port-forwarding, no LAN exposure)
+
+The `vpn-only` profile keeps the API on loopback and uses Tailscale to create a private WireGuard mesh. Only Tailscale peers can reach it — no firewall holes in UFW, no open LAN port.
+
+```
+[Tailscale peer: 100.x.x.x] ──WireGuard──► Tailscale IP on this host
+                                               ──► 127.0.0.1:8080 (Docker)
+[Internet / LAN (no Tailscale)] ──► blocked (port never opened)
+```
+
+### Prerequisites
+
+- A free [Tailscale account](https://tailscale.com/) (sign in with Google/GitHub/email).
+- The devices that will call the API must also be in your Tailscale network.
+- Optional: a Tailscale auth key for non-interactive setup ([generate one here](https://login.tailscale.com/admin/settings/keys)).
+
+### Via the wizard
+
+Select **[3] VPN only (Tailscale)** in Step 3/5 · Network / Access Profile. In Step 5 (System) you will be prompted for an optional auth key.
+
+### Via batch mode
+
+```bash
+# With pre-generated auth key (fully automated)
+sudo python3 -m llama_deploy deploy --batch \
+  --profile vpn-only \
+  --tailscale-authkey tskey-auth-xxxxxxxxxxxx-xxxxxxxxxxxxxxxx \
+  --port 8080
+
+# Without auth key (tailscale up will print an interactive login URL)
+sudo python3 -m llama_deploy deploy --batch \
+  --profile vpn-only \
+  --port 8080
+```
+
+### What happens during deployment
+
+1. Tailscale is installed via the official install script if not already present.
+2. `tailscale up --accept-routes` is run (with auth key if provided).
+3. The Tailscale IP (`100.x.x.x`) is shown in the deployment summary.
+4. UFW is **not** asked to open port 8080 — Tailscale's kernel WireGuard interface handles routing.
+
+### Connecting from another Tailscale device
+
+Use the server's Tailscale IP from the summary (e.g. `100.64.0.1`):
+
+```bash
+curl http://100.64.0.1:8080/v1/models \
+  -H "Authorization: Bearer <token>"
+```
+
+Python OpenAI SDK:
+
+```python
+client = OpenAI(base_url="http://100.64.0.1:8080/v1", api_key="<token>")
+```
+
+### Security notes
+
+- `ss -lntp` will show port 8080 bound to `127.0.0.1` only — no LAN/WAN exposure.
+- `ufw status` will show no rule for port 8080 — Tailscale's WireGuard tunnel is outside UFW scope.
+- To check VPN health: `tailscale status`.
+- Traffic between Tailscale nodes is end-to-end encrypted via WireGuard.
+
+---
+
 ## Exposing publicly with HTTPS (NGINX + Let's Encrypt)
 
 When you want the API reachable over the internet, the recommended path is NGINX as a TLS-terminating reverse proxy with a free Let's Encrypt certificate. The Docker container stays bound to loopback — it is never directly exposed.
@@ -380,26 +517,22 @@ Internet ──HTTPS 443──► NGINX ──HTTP──► 127.0.0.1:8080 (Dock
 
 ### Via the wizard
 
-Select **[2] HTTPS + domain** in Step 3/5 · Network:
+Select **[4] Internet / Public** → **[1] HTTPS + domain** in Step 3/5 · Network / Access Profile:
 
 ```
-╔════════════════════════════════════════════════════╗
-║  Step 3/5 · Network                               ║
-╚════════════════════════════════════════════════════╝
+  [4] Internet / Public     NGINX + Let's Encrypt TLS — or direct 0.0.0.0
 
-  [1] Localhost only   127.0.0.1 — most secure, for local apps only
-  [2] HTTPS + domain   NGINX + Let's Encrypt — recommended for internet exposure
-  [3] All interfaces   0.0.0.0 — direct exposure without TLS
-  [4] Docker network   no host port — only from other containers
+  [1] HTTPS + domain   NGINX + Let's Encrypt — recommended
+  [2] All interfaces   0.0.0.0 plain HTTP — no TLS
 
-Choice [1]: 2
+Choice [1]:
 
   NGINX will listen on :80 and :443 and proxy to the loopback port.
   Make sure your domain's DNS A record already points to this server.
 
   Domain name (e.g. api.example.com): api.myserver.com
   Email for Let's Encrypt renewal notices: me@example.com
-  Internal port [8080]:
+  Port [8080]:
 ```
 
 ### Via batch mode
@@ -550,6 +683,47 @@ Only the SHA-256 hash is stored. The plaintext value is shown once at creation a
 
 ---
 
+## Security checklist
+
+Run through this after every deployment to confirm your exposure matches your intent.
+
+### All profiles
+
+- [ ] `docker ps` shows container as `Up` and healthy.
+- [ ] `docker inspect llama-router | grep -A5 Ports` shows the expected port binding (host IP should be `127.0.0.1` unless profile=`public`).
+- [ ] `cat <base-dir>/secrets/tokens.json | python3 -m json.tool` — confirm token exists and is `active`.
+- [ ] Container is hardened: `docker inspect llama-router | grep -E 'ReadonlyRootfs|NoNewPrivileges'` → both `true`.
+
+### `localhost` profile
+
+- [ ] `ss -lntp | grep 8080` shows `127.0.0.1:8080` — **not** `0.0.0.0:8080`.
+- [ ] `curl http://192.168.1.x:8080/v1/models` from another LAN device → connection refused.
+
+### `home-private` profile
+
+- [ ] `ss -lntp | grep 8080` shows `127.0.0.1:8080` (Docker bind is loopback; UFW handles LAN).
+- [ ] `ufw status numbered | grep 8080` shows `ALLOW from <lan-cidr>` AND `DENY 8080/tcp`.
+- [ ] `curl http://<server-lan-ip>:8080/v1/models -H "Authorization: Bearer <token>"` → 200 from a LAN device.
+- [ ] `curl http://<server-lan-ip>:8080/v1/models` from a device **outside** the LAN CIDR → connection refused or timeout.
+
+### `vpn-only` profile
+
+- [ ] `tailscale status` shows this node as `online`.
+- [ ] `ss -lntp | grep 8080` shows `127.0.0.1:8080` — **not** `0.0.0.0:8080`.
+- [ ] `ufw status | grep 8080` → **no rule** (port is not opened; Tailscale handles routing).
+- [ ] `curl http://<tailscale-ip>:8080/v1/models -H "Authorization: Bearer <token>"` from a Tailscale peer → 200.
+- [ ] `curl http://<tailscale-ip>:8080/v1/models` from a non-Tailscale device → connection refused.
+
+### `public` (NGINX + TLS) profile
+
+- [ ] `curl https://<domain>/v1/models -H "Authorization: Bearer <token>"` → 200.
+- [ ] `curl http://<domain>/v1/models` → 301 redirect to HTTPS.
+- [ ] `ss -lntp | grep 8080` shows `127.0.0.1:8080` (Docker behind NGINX).
+- [ ] `ufw status | grep 8080` → **no rule** (only 80 and 443 are open).
+- [ ] `certbot certificates` → certificate valid, expiry > 30 days.
+
+---
+
 ## Re-deploying / updating
 
 Running the deploy command again is safe — all system steps are idempotent:
@@ -589,8 +763,9 @@ llama_deploy/
 ├── nginx.py          NGINX install, proxy config, certbot, UFW ports 80+443
 ├── orchestrator.py   Step, run_steps(), run_deploy()
 ├── service.py        write_models_ini(), write_compose(), docker_*()
-├── health.py         wait_health(), curl_smoke_tests(), sanity_checks()
-├── system.py         ensure_*() idempotent OS operations
+├── health.py         wait_health(), curl_smoke_tests(), sanity_checks(), profile_smoke_checks()
+├── system.py         ensure_*() idempotent OS operations (UFW rules are profile-aware)
+├── tailscale.py      Tailscale install, up, IP retrieval, health check
 ├── tokens.py         TokenRecord, TokenStore (create / revoke / sync keyfile)
 └── wizard.py         interactive 5-step HITL wizard → Config
 ```
@@ -621,8 +796,24 @@ docker compose -f /opt/llama/docker-compose.yml restart llama
 ```
 In `hashed` mode, revocation is immediate and no restart is required.
 
-**I want to expose the API over the network.**
-Use `--bind 0.0.0.0 --open-firewall` in batch mode, or choose "All interfaces" in the wizard. Make sure you understand the security implications — the API will be reachable by anyone who can reach the host. For a production setup, prefer option [2] HTTPS + domain in the wizard instead.
+**I want to expose the API over the network — which profile should I use?**
+
+| Goal | Profile | Command |
+|---|---|---|
+| Access from this machine only | `localhost` (default) | no extra flags |
+| Access from home LAN devices | `home-private` | `--profile home-private --lan-cidr 192.168.1.0/24` |
+| Access from anywhere via VPN | `vpn-only` | `--profile vpn-only [--tailscale-authkey KEY]` |
+| Access from internet with TLS | `public` + domain | `--domain api.example.com --certbot-email me@x.com` |
+| Access from internet bare HTTP | `public` + open port | `--profile public --open-firewall` |
+
+**Port 8080 is accessible from my LAN even though I chose `home-private`.**
+Verify the Docker bind: `ss -lntp | grep 8080` should show `127.0.0.1:8080`, not `0.0.0.0:8080`. Then verify the UFW rule: `ufw status numbered` should show `ALLOW from 192.168.1.0/24 to any port 8080` and `DENY 8080/tcp`. If the Docker port shows `0.0.0.0`, re-deploy — the bind-policy enforcement in `service.py` pins `home-private` to loopback.
+
+**Tailscale says "needs authentication" during deployment.**
+If you did not provide a `--tailscale-authkey`, `tailscale up` will print a login URL to the terminal. Open it in a browser on any device, authenticate, and deployment will continue automatically.
+
+**`ss -lntp` shows port 8080 on 0.0.0.0 after a VPN-only deploy.**
+This should not happen — `vpn-only` pins the Docker bind to `127.0.0.1`. If you see it, check `docker-compose.yml` under `<base-dir>/` and confirm the ports line reads `"127.0.0.1:8080:8080"`. Re-run deploy to regenerate it.
 
 **certbot fails: "Could not find a usable domain name".**
 The DNS A record for your domain must already point to this server's IP address before running the deploy command. Verify with `dig +short api.myserver.com` or `nslookup api.myserver.com`.

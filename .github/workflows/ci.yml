@@ -3,6 +3,7 @@ name: CI
 on:
   push:
   pull_request:
+  workflow_call:   # allows cd.yml to gate on CI passing
 
 jobs:
   test:
@@ -20,8 +21,37 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
 
+      - name: Install tqdm (required for import checks)
+        run: pip install tqdm
+
       - name: Compile package
         run: python -m compileall -q llama_deploy
+
+      - name: AST parse all modules
+        run: |
+          python - <<'EOF'
+          import ast, pathlib, sys
+          failed = []
+          for f in sorted(pathlib.Path("llama_deploy").glob("*.py")):
+              try:
+                  ast.parse(f.read_bytes())
+              except SyntaxError as e:
+                  print(f"FAIL {f}: {e}", file=sys.stderr)
+                  failed.append(f)
+          if failed:
+              sys.exit(1)
+          print(f"AST OK — {len(list(pathlib.Path('llama_deploy').glob('*.py')))} modules")
+          EOF
+
+      - name: Import all modules
+        run: |
+          python -c "
+          from llama_deploy import (
+              config, model, orchestrator, service,
+              system, tailscale, wizard, health, nginx,
+          )
+          print('All imports OK')
+          "
 
       - name: Run unit tests
         run: python -m unittest discover -s tests -v

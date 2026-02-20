@@ -21,9 +21,11 @@ cli.build_config() directly.
 from __future__ import annotations
 
 import sys
+from pathlib import Path
 from typing import List, Optional, Tuple
 
 from llama_deploy.config import (
+    AccessProfile,
     AuthMode,
     BackendKind,
     Config,
@@ -241,59 +243,131 @@ def _step_models() -> Tuple[ModelSpec, ModelSpec]:
     return llm_spec, emb_spec
 
 
+def _detect_lan_cidr() -> Optional[str]:
+    """
+    Best-effort: detect the first non-loopback LAN CIDR from `ip route`.
+
+    Parses kernel-scope link routes (e.g. "192.168.1.0/24 dev eth0 proto kernel
+    scope link src 192.168.1.100") which represent the directly-connected subnet.
+    Returns None if ip is not available or no suitable route is found.
+    """
+    import subprocess as _sp
+    try:
+        out = _sp.check_output(
+            ["ip", "-o", "route", "show"],
+            text=True,
+            stderr=_sp.DEVNULL,
+            timeout=5,
+        )
+        for line in out.splitlines():
+            parts = line.split()
+            if not parts:
+                continue
+            cidr = parts[0]
+            if (
+                "/" in cidr
+                and not cidr.startswith("127.")
+                and not cidr.startswith("169.254.")
+                and cidr != "default"
+            ):
+                return cidr
+    except Exception:
+        pass
+    return None
+
+
 def _step_network() -> Tuple[NetworkConfig, Optional[str], Optional[str]]:
     """
     Returns (NetworkConfig, domain_or_None, certbot_email_or_None).
 
-    Option 2 (HTTPS + domain) keeps the Docker port on loopback and sets up
-    NGINX as the public-facing TLS terminator. The caller passes domain and
+    Profile selection is the primary choice; low-level bind/firewall settings
+    are derived from the chosen profile.  The caller passes domain and
     certbot_email through to Config so the orchestrator can run nginx.py.
     """
-    _header(3, 5, "Network")
+    _header(3, 5, "Network / Access Profile")
+    print("  Choose who should be able to reach the API:")
+    print()
     options = [
-        ("Localhost only",  "127.0.0.1 — most secure, for local apps only"),
-        ("HTTPS + domain",  "NGINX + Let's Encrypt — recommended for internet exposure"),
-        ("All interfaces",  "0.0.0.0 — direct exposure without TLS"),
-        ("Docker network",  "no host port — only from other containers"),
+        ("Localhost only",       "127.0.0.1 — local apps on this machine only"),
+        ("Home / LAN network",   "LAN CIDR — private network access, UFW-restricted"),
+        ("VPN only (Tailscale)", "VPN interface — reachable only via Tailscale or other VPN"),
+        ("Internet / Public",    "NGINX + Let's Encrypt TLS — or direct 0.0.0.0"),
+        ("Docker internal",      "no host port — only reachable from other containers"),
     ]
     idx = _choose(options, default=1)
 
     domain: Optional[str] = None
     certbot_email: Optional[str] = None
+    lan_cidr: Optional[str] = None
+    profile: AccessProfile
 
     if idx == 1:
+        profile = AccessProfile.LOCALHOST
         bind, publish, open_fw = "127.0.0.1", True, False
 
     elif idx == 2:
-        # NGINX terminates TLS; llama-server stays on loopback
-        bind, publish, open_fw = "127.0.0.1", True, False
+        profile = AccessProfile.HOME_PRIVATE
+        bind, publish, open_fw = "0.0.0.0", True, False
         print()
-        _info("NGINX will listen on :80 and :443 and proxy to the loopback port.")
-        _info("Make sure your domain's DNS A record already points to this server.")
-        print()
-        while not domain or "." not in domain:
-            domain = _prompt("Domain name (e.g. api.example.com)")
-            if not domain or "." not in domain:
-                print(_red("  Please enter a valid domain name."))
-        while not certbot_email or "@" not in certbot_email:
-            certbot_email = _prompt("Email for Let's Encrypt renewal notices")
-            if not certbot_email or "@" not in certbot_email:
-                print(_red("  Please enter a valid email address."))
+        _info("UFW will restrict access to your LAN CIDR — the Docker port stays on loopback.")
+        detected_cidr = _detect_lan_cidr()
+        if detected_cidr:
+            _info(f"Detected LAN network: {detected_cidr}")
+        cidr_default = detected_cidr or "192.168.1.0/24"
+        import re as _re
+        while not lan_cidr:
+            raw = _prompt("LAN CIDR", default=cidr_default)
+            if raw and _re.match(r"^\d{1,3}(\.\d{1,3}){3}/\d{1,2}$", raw):
+                lan_cidr = raw
+            else:
+                print(_red("  Please enter a valid CIDR (e.g. 192.168.1.0/24)."))
 
     elif idx == 3:
-        bind, publish, open_fw = "0.0.0.0", True, False
-        _warn("The API will be reachable without TLS from any host on your network.")
-        open_fw = _confirm("Open this port in UFW?", default=True)
+        profile = AccessProfile.VPN_ONLY
+        bind, publish, open_fw = "127.0.0.1", True, False
+        print()
+        _info("The API will stay on loopback; Tailscale provides the VPN endpoint.")
+        _info("Tailscale will be installed and brought up automatically during deployment.")
 
-    else:
+    elif idx == 4:
+        profile = AccessProfile.PUBLIC
+        # Sub-choice: TLS via NGINX or bare 0.0.0.0
+        print()
+        sub_opts = [
+            ("HTTPS + domain",  "NGINX + Let's Encrypt — recommended"),
+            ("All interfaces",  "0.0.0.0 plain HTTP — no TLS"),
+        ]
+        sub_idx = _choose(sub_opts, default=1)
+
+        if sub_idx == 1:
+            bind, publish, open_fw = "127.0.0.1", True, False
+            print()
+            _info("NGINX will listen on :80 and :443 and proxy to the loopback port.")
+            _info("Make sure your domain's DNS A record already points to this server.")
+            print()
+            while not domain or "." not in domain:
+                domain = _prompt("Domain name (e.g. api.example.com)")
+                if not domain or "." not in domain:
+                    print(_red("  Please enter a valid domain name."))
+            while not certbot_email or "@" not in certbot_email:
+                certbot_email = _prompt("Email for Let's Encrypt renewal notices")
+                if not certbot_email or "@" not in certbot_email:
+                    print(_red("  Please enter a valid email address."))
+        else:
+            bind, publish, open_fw = "0.0.0.0", True, False
+            _warn("The API will be reachable without TLS from any host on the internet.")
+            open_fw = _confirm("Open this port in UFW?", default=True)
+
+    else:  # Docker internal
+        profile = AccessProfile.LOCALHOST
         bind, publish, open_fw = "127.0.0.1", False, False
 
     port = 8080
     if publish:
-        port = _prompt_int("Internal port", default=8080, min_val=1024, max_val=65535)
+        port = _prompt_int("Port", default=8080, min_val=1024, max_val=65535)
 
     configure_ufw = True
-    if idx not in (2, 3):
+    if idx not in (2, 4):
         configure_ufw = _confirm("Configure UFW firewall? (keeps SSH open, denies rest)", default=True)
 
     network = NetworkConfig(
@@ -302,6 +376,8 @@ def _step_network() -> Tuple[NetworkConfig, Optional[str], Optional[str]]:
         publish=publish,
         open_firewall=open_fw,
         configure_ufw=configure_ufw,
+        access_profile=profile,
+        lan_cidr=lan_cidr,
     )
     return network, domain, certbot_email
 
@@ -331,16 +407,74 @@ def _step_token() -> Tuple[str, AuthMode]:
     return name or "default", auth_mode
 
 
-def _step_system() -> Tuple[int, str]:
+def _step_system(access_profile) -> Tuple[int, str, Optional[str]]:
+    """
+    Returns (swap_gib, base_dir, tailscale_authkey_or_None).
+
+    tailscale_authkey is only prompted when access_profile == VPN_ONLY.
+    """
     _header(5, 5, "System")
     swap_gib = _prompt_int("Swap file to create if none exists (GiB)", default=8, min_val=0, max_val=256)
     base_dir = _prompt("Base directory for models, config, secrets", default="/opt/llama")
-    return swap_gib, base_dir or "/opt/llama"
+
+    tailscale_authkey: Optional[str] = None
+    if access_profile == AccessProfile.VPN_ONLY:
+        print()
+        _section("Tailscale authentication")
+        _info("An auth key lets tailscale up run non-interactively.")
+        _info("Generate one at https://login.tailscale.com/admin/settings/keys")
+        _info("Leave blank to authenticate interactively during deployment.")
+        print()
+        raw_key = _prompt("Tailscale auth key (optional)")
+        if raw_key:
+            tailscale_authkey = raw_key
+
+    return swap_gib, base_dir or "/opt/llama", tailscale_authkey
 
 
 # ---------------------------------------------------------------------------
 # Review + confirm
 # ---------------------------------------------------------------------------
+
+def _ram_advisory(hf_repo: str) -> None:
+    """
+    Print a RAM adequacy warning before the user confirms deployment.
+
+    Estimates required RAM from the parameter count in the repo name
+    (e.g. "14B" → 14 billion params) using a rough Q4_K_M heuristic:
+      ~0.55 GB per billion parameters + 4 GB OS/KV-cache overhead.
+    Silently returns if detection fails (non-Linux, missing /proc/meminfo,
+    no param count in the repo name).
+    """
+    import re as _re
+    try:
+        meminfo = Path("/proc/meminfo").read_text(encoding="utf-8")
+        for line in meminfo.splitlines():
+            if line.startswith("MemTotal:"):
+                total_gib = int(line.split()[1]) / (1024 ** 2)
+                break
+        else:
+            return
+    except Exception:
+        return
+
+    m = _re.search(r"(\d+(?:\.\d+)?)B", hf_repo, _re.IGNORECASE)
+    if not m:
+        return
+    params_b = float(m.group(1))
+    est_gib = params_b * 0.55 + 4  # Q4_K_M ~0.55 GB/B-param + OS/KV overhead
+
+    label = hf_repo.split("/")[-1]
+    print()
+    if total_gib < est_gib * 0.8:
+        _info(f"RAM advisory: {total_gib:.0f} GB detected — {label} needs ~{est_gib:.0f} GB.")
+        _info("Auto-optimize will try to downshift to a smaller model.")
+        _info("Consider choosing a 3B–7B model if this server has limited RAM.")
+    elif total_gib < est_gib * 1.2:
+        _info(f"RAM advisory: {total_gib:.0f} GB detected — {label} needs ~{est_gib:.0f} GB (tight; swap helps).")
+    else:
+        _info(f"RAM: {total_gib:.0f} GB detected — sufficient for {label}.")
+
 
 def _review(cfg: Config) -> None:
     print()
@@ -353,6 +487,7 @@ def _review(cfg: Config) -> None:
         ("Backend",    cfg.image),
         ("LLM",        f"{cfg.llm.effective_alias}  (ctx {cfg.llm.ctx_len})"),
         ("Embedding",  f"{cfg.emb.effective_alias}  (ctx {cfg.emb.ctx_len})"),
+        ("Profile",    net.profile_label),
         ("Endpoint",   cfg.public_base_url),
         ("Firewall",   "UFW enabled" if net.configure_ufw else "UFW skipped"),
         ("Token name", f'"{cfg.api_token_name}"'),
@@ -360,12 +495,16 @@ def _review(cfg: Config) -> None:
         ("Base dir",   str(cfg.base_dir)),
     ]
     if cfg.use_tls:
-        rows.insert(4, ("TLS domain",  cfg.domain))
-        rows.insert(5, ("Cert email",  cfg.certbot_email))
+        rows.insert(5, ("TLS domain",  cfg.domain))
+        rows.insert(6, ("Cert email",  cfg.certbot_email))
+    if cfg.network.access_profile == AccessProfile.VPN_ONLY:
+        ts_status = "auth key set" if cfg.tailscale_authkey else "interactive auth (no key)"
+        rows.append(("Tailscale", ts_status))
     col = max(len(k) for k, _ in rows) + 2
     for k, v in rows:
         print(f"  {_dim(k.ljust(col))} {v}")
     print(_bold("─" * _BOX_WIDTH))
+    _ram_advisory(cfg.llm.hf_repo)
 
 
 # ---------------------------------------------------------------------------
@@ -388,7 +527,7 @@ def run_wizard() -> Config:
     llm_spec, emb_spec  = _step_models()
     network, domain, certbot_email = _step_network()
     token_name, auth_mode = _step_token()
-    swap_gib, base_dir_str = _step_system()
+    swap_gib, base_dir_str, tailscale_authkey = _step_system(network.access_profile)
 
     from pathlib import Path
     cfg = Config(
@@ -404,10 +543,12 @@ def run_wizard() -> Config:
         skip_download=False,
         llm=llm_spec,
         emb=emb_spec,
+        auto_optimize=True,
         allow_unverified_downloads=False,
         domain=domain,
         certbot_email=certbot_email,
         auth_mode=auth_mode,
+        tailscale_authkey=tailscale_authkey,
     )
 
     _review(cfg)

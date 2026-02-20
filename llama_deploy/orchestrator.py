@@ -1,4 +1,4 @@
-﻿"""
+"""
 Deployment orchestrator: Step protocol, run_steps runner, and run_deploy().
 
 The Step dataclass replaces the original (label, fn) tuple list that used
@@ -9,7 +9,7 @@ the function (Bug 1).
 Token management uses TokenStore (tokens.py) instead of the old ensure_token_file.
 The token value is shown ONCE after deployment if it was newly created.
 
-All steps â€” including HF download, config writing, and Docker startup â€” are
+All steps â€" including HF download, config writing, and Docker startup â€" are
 included in a single all_steps list so the progress bar reflects the true
 total (Bug 7).
 
@@ -28,9 +28,10 @@ Hashed:
 from __future__ import annotations
 
 import datetime as dt
+import os
 import subprocess
 import sys
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, Callable, List, Optional, Set, Tuple
 
 
@@ -160,6 +161,13 @@ _EMB_RETRY_PRESETS: List[Tuple[str, str, List[str]]] = [
     ("BGE small EN v1.5", "lmstudio-community/bge-small-en-v1.5-GGUF", ["Q8_0", "F16", "Q6_K", "Q4_K_M"]),
 ]
 
+_DEFAULT_LLM_REPO = "unsloth/Ministral-3-14B-Instruct-2512-GGUF"
+_DEFAULT_LLM_PATTERNS = ["Q4_K_M", "Q5_K_M", "Q4_0", "Q3_K_M"]
+_MID_LLM_REPO = "Qwen/Qwen3-8B-GGUF"
+_MID_LLM_PATTERNS = ["Q4_K_M", "Q5_K_M", "Q4_0", "Q3_K_M"]
+_SMALL_LLM_REPO = "bartowski/Phi-3.5-mini-instruct-GGUF"
+_SMALL_LLM_PATTERNS = ["Q4_K_M", "Q5_K_M", "Q4_0"]
+
 
 def _spec_key(spec) -> str:
     return f"{spec.hf_repo}|{','.join(spec.candidate_patterns)}|{int(spec.is_embedding)}|{spec.ctx_len}"
@@ -274,6 +282,141 @@ def _resolve_model_with_retry(cfg, initial_spec, kind: str):
             spec = next_spec
 
 
+def _detect_mem_total_gib() -> Optional[float]:
+    """
+    Return total system RAM in GiB from /proc/meminfo, or None if unavailable.
+    """
+    try:
+        with open("/proc/meminfo", "r", encoding="utf-8") as f:
+            for line in f:
+                if line.startswith("MemTotal:"):
+                    parts = line.split()
+                    if len(parts) >= 2:
+                        kib = float(parts[1])
+                        return kib / (1024.0 * 1024.0)
+    except Exception:
+        return None
+    return None
+
+
+def _auto_optimize_cfg(cfg):
+    """
+    Tune deployment settings using host specs to reduce OOM risk.
+
+    Strategy
+    --------
+    - Detect RAM and CPU core count.
+    - Downshift default heavy LLM on low-memory hosts.
+    - Clamp ctx / models_max / swap for safer startup on constrained systems.
+    - Keep explicit custom --llm-repo choices intact (unless they match default).
+
+    Override rules
+    --------------
+    - A setting is only changed when it would still be at its default value.
+      If the user already overrode a value (e.g. --ctx-llm 8192 on a 12 GiB
+      machine), that choice is respected and flagged with [AUTO-SKIP] so the
+      user can see the recommendation without being silently overruled.
+    - Every change is logged with [AUTO] old -> new so decisions are auditable.
+    - If no /proc/meminfo is available the entire pass is skipped cleanly.
+    """
+    from llama_deploy.log import log_line
+
+    mem_gib = _detect_mem_total_gib()
+    cores = os.cpu_count() or 1
+    if mem_gib is None:
+        tqdm.write("[AUTO] Could not read /proc/meminfo; skipping auto optimization.")
+        return cfg
+
+    tuned = cfg
+    changes: list = []   # str entries logged as [AUTO]
+    skipped: list = []   # str entries logged as [AUTO-SKIP]
+
+    def _log_change(msg: str) -> None:
+        changes.append(msg)
+        log_line(f"[AUTO] {msg}")
+
+    def _log_skip(msg: str) -> None:
+        skipped.append(msg)
+        log_line(f"[AUTO-SKIP] {msg}")
+
+    # ---- models_max --------------------------------------------------------
+    if mem_gib < 16 and tuned.models_max > 1:
+        _log_change(f"models_max: {tuned.models_max} -> 1  (RAM {mem_gib:.1f} GiB < 16 GiB)")
+        tuned = replace(tuned, models_max=1)
+
+    # ---- swap --------------------------------------------------------------
+    if mem_gib < 8:
+        rec_swap = 24
+    elif mem_gib < 16:
+        rec_swap = 16
+    else:
+        rec_swap = tuned.swap_gib  # no change needed
+
+    if tuned.swap_gib < rec_swap:
+        _log_change(f"swap_gib: {tuned.swap_gib} -> {rec_swap}  (OOM guard for {mem_gib:.1f} GiB RAM)")
+        tuned = replace(tuned, swap_gib=rec_swap)
+
+    # ---- LLM repo / ctx  ---------------------------------------------------
+    # Only auto-switch when the user is running the default heavy model.
+    using_default_llm = (
+        tuned.llm.hf_repo == _DEFAULT_LLM_REPO
+        and tuned.llm.candidate_patterns == _DEFAULT_LLM_PATTERNS
+    )
+
+    if using_default_llm:
+        if mem_gib < 10:
+            rec_repo, rec_pats, rec_ctx = _SMALL_LLM_REPO, list(_SMALL_LLM_PATTERNS), min(tuned.llm.ctx_len, 2048)
+            label = "Phi-3.5-mini"
+        elif mem_gib < 16:
+            rec_repo, rec_pats, rec_ctx = _MID_LLM_REPO, list(_MID_LLM_PATTERNS), min(tuned.llm.ctx_len, 3072)
+            label = "Qwen3-8B"
+        elif mem_gib < 24 and tuned.llm.ctx_len > 3072:
+            rec_repo, rec_pats, rec_ctx = tuned.llm.hf_repo, tuned.llm.candidate_patterns, 3072
+            label = None
+        else:
+            rec_repo, rec_pats, rec_ctx, label = None, None, None, None
+
+        if rec_repo is not None and rec_repo != tuned.llm.hf_repo:
+            _log_change(
+                f"llm_repo: Ministral-3-14B -> {label}  (RAM {mem_gib:.1f} GiB)"
+            )
+            llm = replace(tuned.llm, hf_repo=rec_repo, candidate_patterns=rec_pats,
+                          ctx_len=rec_ctx)
+            tuned = replace(tuned, llm=llm)
+        elif rec_ctx is not None and rec_ctx != tuned.llm.ctx_len:
+            _log_change(f"llm_ctx: {tuned.llm.ctx_len} -> {rec_ctx}  (RAM {mem_gib:.1f} GiB < 24 GiB)")
+            tuned = replace(tuned, llm=replace(tuned.llm, ctx_len=rec_ctx))
+    else:
+        # User chose a custom model — report what we would have done without overriding.
+        if mem_gib < 10:
+            _log_skip(
+                f"Would switch LLM to Phi-3.5-mini (RAM {mem_gib:.1f} GiB), "
+                f"but keeping user-selected {tuned.llm.hf_repo}."
+            )
+        elif mem_gib < 16:
+            _log_skip(
+                f"Would switch LLM to Qwen3-8B (RAM {mem_gib:.1f} GiB), "
+                f"but keeping user-selected {tuned.llm.hf_repo}."
+            )
+
+    # ---- embedding ctx -----------------------------------------------------
+    if mem_gib < 8 and tuned.emb.ctx_len > 1024:
+        _log_change(f"emb_ctx: {tuned.emb.ctx_len} -> 1024  (RAM {mem_gib:.1f} GiB < 8 GiB)")
+        tuned = replace(tuned, emb=replace(tuned.emb, ctx_len=1024))
+
+    # ---- summary -----------------------------------------------------------
+    tqdm.write(f"[AUTO] Host specs: RAM={mem_gib:.1f} GiB, CPU={cores} cores")
+    if changes:
+        for c in changes:
+            tqdm.write(f"[AUTO] {c}")
+    else:
+        tqdm.write("[AUTO] No tuning changes needed.")
+    for s in skipped:
+        tqdm.write(f"[AUTO-SKIP] {s}")
+
+    return tuned
+
+
 def run_steps(steps: List[Step], bar: tqdm) -> None:
     from llama_deploy.log import log_line
     import time
@@ -333,7 +476,7 @@ def _is_new_token(cfg) -> bool:
 
 
 # ---------------------------------------------------------------------------
-# run_deploy()  â€” the core deployment pipeline
+# run_deploy()  â€" the core deployment pipeline
 # ---------------------------------------------------------------------------
 
 def run_deploy(cfg) -> None:
@@ -350,6 +493,7 @@ def run_deploy(cfg) -> None:
         ensure_base_packages,
         ensure_unattended_upgrades,
         ensure_docker,
+        ensure_docker_daemon_hardening,
         ensure_swap,
         ensure_firewall,
     )
@@ -361,12 +505,17 @@ def run_deploy(cfg) -> None:
         docker_pull,
         docker_compose_up,
     )
-    from llama_deploy.health import wait_health, curl_smoke_tests, sanity_checks
+    from llama_deploy.health import wait_health, curl_smoke_tests, sanity_checks, profile_smoke_checks
     from llama_deploy.log import log_line, redact, LOG_PATH
 
     require_root_reexec()
     detect_ubuntu()
     _ensure_tqdm(allow_install=True)
+
+    if cfg.auto_optimize:
+        cfg = _auto_optimize_cfg(cfg)
+    else:
+        tqdm.write("[AUTO] Host-spec auto optimization disabled by config.")
 
     tqdm.write(f"[INFO] Logging to: {LOG_PATH}")
     log_line(f"=== START {dt.datetime.now(dt.timezone.utc).isoformat()}Z ===")
@@ -391,6 +540,7 @@ def run_deploy(cfg) -> None:
         Step("Install base packages",      ensure_base_packages),
         Step("Enable unattended upgrades", ensure_unattended_upgrades),
         Step("Install / enable Docker",    ensure_docker),
+        Step("Docker daemon hardening",    ensure_docker_daemon_hardening),
         Step("Ensure swap",                lambda: ensure_swap(cfg.swap_gib)),
         Step(
             "Firewall (UFW) hardening",
@@ -403,14 +553,28 @@ def run_deploy(cfg) -> None:
     # -----------------------------------------------------------------------
     # Phase 2: Model resolution and download
     # -----------------------------------------------------------------------
+    _unverified_models: list = []  # mutable cell — populated if trust_overridden
+
+    def _resolve_llm():
+        spec = _resolve_model_with_retry(cfg, cfg.llm, "LLM")
+        if spec.trust_overridden:
+            _unverified_models.append(spec.effective_alias)
+        return spec
+
+    def _resolve_emb():
+        spec = _resolve_model_with_retry(cfg, cfg.emb, "Embedding")
+        if spec.trust_overridden:
+            _unverified_models.append(spec.effective_alias)
+        return spec
+
     llm_step = Step(
         label="Resolve + download LLM GGUF",
-        fn=lambda: _resolve_model_with_retry(cfg, cfg.llm, "LLM"),
+        fn=_resolve_llm,
         skip_if=lambda: cfg.skip_download,
     )
     emb_step = Step(
         label="Resolve + download embedding GGUF",
-        fn=lambda: _resolve_model_with_retry(cfg, cfg.emb, "Embedding"),
+        fn=_resolve_emb,
         skip_if=lambda: cfg.skip_download,
     )
 
@@ -453,7 +617,29 @@ def run_deploy(cfg) -> None:
     up_step     = Step("Start Docker Compose", lambda: docker_compose_up(cfg.compose_path))
 
     # -----------------------------------------------------------------------
-    # Phase 3b: NGINX â€” local auth proxy (hashed, no domain) OR TLS (domain set)
+    # Phase 2b: Tailscale (vpn-only profile)
+    # -----------------------------------------------------------------------
+    from llama_deploy.config import AccessProfile
+
+    tailscale_ip_holder: list = []  # mutable cell so the summary can read it later
+
+    def _setup_tailscale() -> None:
+        from llama_deploy.tailscale import tailscale_install, tailscale_up, tailscale_ip
+        tailscale_install()
+        tailscale_up(auth_key=cfg.tailscale_authkey)
+        ip = tailscale_ip()
+        tailscale_ip_holder.clear()
+        tailscale_ip_holder.append(ip)
+        tqdm.write(f"[TS] VPN endpoint ready: {ip}:{cfg.network.port}")
+
+    tailscale_step = Step(
+        label="Tailscale VPN setup",
+        fn=_setup_tailscale,
+        skip_if=lambda: cfg.network.access_profile != AccessProfile.VPN_ONLY,
+    )
+
+    # -----------------------------------------------------------------------
+    # Phase 3b: NGINX — local auth proxy (hashed, no domain) OR TLS (domain set)
     # -----------------------------------------------------------------------
     # When hashed + domain: ensure_tls_for_domain handles NGINX (with auth_request).
     # When hashed + no domain: ensure_local_proxy installs NGINX without certbot.
@@ -514,7 +700,7 @@ def run_deploy(cfg) -> None:
         )
     else:
         project  = cfg.base_dir.name
-        net_name = f"{project}_llm_internal"
+        net_name = f"{project}_appnet"
 
         def _internal_test() -> None:
             from llama_deploy.log import sh
@@ -529,12 +715,14 @@ def run_deploy(cfg) -> None:
         health_step = Step("Internal network smoke test", _internal_test)
         smoke_step  = Step("Sanity checks", lambda: sanity_checks(cfg))
 
-    sanity_step = Step("Sanity checks (ports + logs)", lambda: sanity_checks(cfg))
+    sanity_step        = Step("Sanity checks (ports + logs)", lambda: sanity_checks(cfg))
+    profile_check_step = Step("Profile smoke-checks",         lambda: profile_smoke_checks(cfg))
 
     service_steps = [
         config_step, pull_step, up_step,
+        tailscale_step,
         local_proxy_step, tls_step,
-        health_step, smoke_step, sanity_step,
+        health_step, smoke_step, sanity_step, profile_check_step,
     ]
 
     all_steps: List[Step] = system_steps + [llm_step, emb_step] + service_steps
@@ -552,7 +740,10 @@ def run_deploy(cfg) -> None:
         # -------------------------------------------------------------------
         # Post-deploy summary
         # -------------------------------------------------------------------
-        _print_summary(cfg, token_step.result.value, first_run)
+        _print_summary(cfg, token_step.result.value, first_run, _unverified_models)
+        if tailscale_ip_holder:
+            ts_ip = tailscale_ip_holder[0]
+            tqdm.write(f"  VPN endpoint : {ts_ip}:{cfg.network.port}  (Tailscale)")
     finally:
         runtime = token_step.result
         if isinstance(runtime, TokenRuntime) and runtime.temporary_id:
@@ -573,7 +764,7 @@ def run_deploy(cfg) -> None:
         log_line(f"=== END {dt.datetime.now(dt.timezone.utc).isoformat()}Z ===")
 
 
-def _print_summary(cfg, api_token: str, first_run: bool) -> None:
+def _print_summary(cfg, api_token: str, first_run: bool, unverified_models: list) -> None:
     from llama_deploy.config import AuthMode
 
     print()
@@ -613,6 +804,15 @@ def _print_summary(cfg, api_token: str, first_run: bool) -> None:
     print(f'  POST /v1/embeddings        model="{cfg.emb.effective_alias}"')
     print()
 
+    if unverified_models:
+        print("*** SECURITY WARNING " + "*" * 33)
+        print("The following models were deployed WITHOUT verified checksums:")
+        for alias in unverified_models:
+            print(f"  - {alias}")
+        print("Re-deploy with verified models before using in production.")
+        print("*" * 54)
+        print()
+
 
 # ---------------------------------------------------------------------------
 # Legacy entry point (direct invocation without subcommands)
@@ -629,4 +829,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

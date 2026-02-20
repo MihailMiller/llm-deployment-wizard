@@ -31,6 +31,27 @@ class AuthMode(str, Enum):
     HASHED    = "hashed"     # NGINX auth_request → sidecar (only SHA-256 hashes stored)
 
 
+class AccessProfile(str, Enum):
+    """
+    Named access profiles that encode the intended exposure of the API.
+
+    Each profile determines which source addresses may reach the service and
+    how the firewall should be configured.  The detailed UFW rule set is
+    applied in system.ensure_firewall(); service.write_compose() uses the
+    profile to enforce correct bind addresses.
+
+      LOCALHOST    — loopback only; no external access.
+      HOME_PRIVATE — LAN/home network access restricted via UFW to lan_cidr.
+      VPN_ONLY     — reachable only via VPN interface (e.g. Tailscale).
+      PUBLIC       — internet-facing: either NGINX+TLS or a fully open interface.
+    """
+
+    LOCALHOST    = "localhost"
+    HOME_PRIVATE = "home-private"
+    VPN_ONLY     = "vpn-only"
+    PUBLIC       = "public"
+
+
 @dataclass(frozen=True)
 class ModelSpec:
     """
@@ -55,9 +76,10 @@ class ModelSpec:
     is_embedding: bool = False
 
     # Populated by model.resolve_model(); not set from CLI
-    resolved_filename: Optional[str] = field(default=None, compare=False)
-    resolved_sha256:   Optional[str] = field(default=None, compare=False)
-    resolved_size:     Optional[int] = field(default=None, compare=False)
+    resolved_filename:  Optional[str]  = field(default=None,  compare=False)
+    resolved_sha256:    Optional[str]  = field(default=None,  compare=False)
+    resolved_size:      Optional[int]  = field(default=None,  compare=False)
+    trust_overridden:   bool           = field(default=False, compare=False)
 
     def __post_init__(self) -> None:
         if not self.hf_repo:
@@ -82,7 +104,14 @@ class ModelSpec:
             return self.alias
         return re.sub(r"-GGUF$", "", self.hf_repo, flags=re.IGNORECASE)
 
-    def with_resolved(self, filename: str, sha256: str, size: int) -> "ModelSpec":
+    def with_resolved(
+        self,
+        filename: str,
+        sha256: str,
+        size: int,
+        *,
+        trust_overridden: bool = False,
+    ) -> "ModelSpec":
         """Return a new frozen ModelSpec with resolved download metadata."""
         return ModelSpec(
             hf_repo=self.hf_repo,
@@ -93,6 +122,7 @@ class ModelSpec:
             resolved_filename=filename,
             resolved_sha256=sha256,
             resolved_size=size,
+            trust_overridden=trust_overridden,
         )
 
 
@@ -104,6 +134,14 @@ class NetworkConfig:
     All invariants are enforced at construction time via __post_init__ so that
     invalid combinations are caught immediately at argument-parse time rather
     than partway through main() execution.
+
+    access_profile is the *intent* of the deployment (who should reach it).
+    It drives firewall rule generation in system.ensure_firewall() and bind
+    address enforcement in service.write_compose().  The low-level bind_host /
+    open_firewall fields remain for fine-grained batch-mode control.
+
+    lan_cidr is required when access_profile=home-private and specifies the
+    source network for UFW ALLOW rules (e.g. "192.168.1.0/24").
     """
 
     bind_host: str = "127.0.0.1"
@@ -111,6 +149,8 @@ class NetworkConfig:
     publish: bool = True          # maps Docker port to host
     open_firewall: bool = False   # open the port in UFW (replaces --allow-public-port)
     configure_ufw: bool = True    # whether to touch UFW at all (replaces --no-ufw)
+    access_profile: AccessProfile = AccessProfile.LOCALHOST
+    lan_cidr: Optional[str] = None  # required for home-private profile
 
     def __post_init__(self) -> None:
         if self.bind_host == "0.0.0.0" and not self.publish:
@@ -123,6 +163,38 @@ class NetworkConfig:
                 "--open-firewall only makes sense with --bind 0.0.0.0; "
                 "there is nothing to open in UFW for a loopback-only service."
             )
+        # Profile-consistency invariants
+        if self.access_profile == AccessProfile.HOME_PRIVATE and not self.lan_cidr:
+            raise ValueError(
+                "access_profile=home-private requires --lan-cidr "
+                "(e.g. 192.168.1.0/24) to restrict UFW to your LAN."
+            )
+        if self.access_profile == AccessProfile.LOCALHOST and self.bind_host == "0.0.0.0":
+            raise ValueError(
+                "access_profile=localhost cannot bind to 0.0.0.0; "
+                "use --bind 127.0.0.1 (the default) for loopback-only access."
+            )
+        if self.access_profile == AccessProfile.VPN_ONLY and self.open_firewall:
+            raise ValueError(
+                "access_profile=vpn-only must not open the firewall to all; "
+                "remove --open-firewall."
+            )
+        if self.lan_cidr is not None:
+            # Basic CIDR format check (does not validate prefix length range)
+            import re as _re
+            if not _re.match(
+                r"^\d{1,3}(\.\d{1,3}){3}/\d{1,2}$",
+                self.lan_cidr,
+            ):
+                raise ValueError(
+                    f"lan_cidr={self.lan_cidr!r} is not a valid CIDR "
+                    "(expected format: A.B.C.D/prefix, e.g. 192.168.1.0/24)."
+                )
+        if self.access_profile == AccessProfile.HOME_PRIVATE and self.open_firewall:
+            raise ValueError(
+                "access_profile=home-private must not use --open-firewall; "
+                "UFW access is restricted to lan_cidr automatically."
+            )
 
     @property
     def is_public(self) -> bool:
@@ -131,6 +203,17 @@ class NetworkConfig:
     @property
     def base_url(self) -> str:
         return f"http://{self.bind_host}:{self.port}"
+
+    @property
+    def profile_label(self) -> str:
+        """Human-readable summary of the access profile for logs and review."""
+        labels = {
+            AccessProfile.LOCALHOST:    "localhost (loopback only)",
+            AccessProfile.HOME_PRIVATE: f"home-private (LAN {self.lan_cidr})",
+            AccessProfile.VPN_ONLY:     "vpn-only (Tailscale / VPN)",
+            AccessProfile.PUBLIC:       "public (internet-facing)",
+        }
+        return labels.get(self.access_profile, self.access_profile.value)
 
 
 @dataclass(frozen=True)
@@ -155,10 +238,12 @@ class Config:
     skip_download: bool           # skip HF queries if model files already verified
     llm: ModelSpec
     emb: ModelSpec
+    auto_optimize: bool = True            # tune model/runtime defaults from detected host specs
     allow_unverified_downloads: bool = False  # permit trusting downloads when upstream SHA cannot be proven
     domain: Optional[str] = None          # public domain for NGINX + Let's Encrypt TLS
     certbot_email: Optional[str] = None   # email for Let's Encrypt renewal notices
     auth_mode: AuthMode = AuthMode.PLAINTEXT  # token storage strategy
+    tailscale_authkey: Optional[str] = None   # auth key for non-interactive tailscale up (vpn-only profile)
 
     # Internal ports used in hashed mode (not user-configurable)
     @property

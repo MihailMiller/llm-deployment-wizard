@@ -34,7 +34,7 @@ import json
 from pathlib import Path
 from typing import List, Optional
 
-from llama_deploy.config import AuthMode, BackendKind, Config, ModelSpec, NetworkConfig
+from llama_deploy.config import AccessProfile, AuthMode, BackendKind, Config, ModelSpec, NetworkConfig
 
 _DEFAULT_LLM_CANDIDATES = "Q4_K_M,Q5_K_M,Q4_0,Q3_K_M"
 _DEFAULT_EMB_CANDIDATES = "Q8_0,F16,Q6_K,Q4_K_M"
@@ -66,8 +66,24 @@ def build_config(argv: Optional[List[str]] = None) -> Config:
                    help="llama.cpp Docker image variant. (default: cpu)")
 
     g = parser.add_argument_group("Network")
-    g.add_argument("--bind", default="127.0.0.1", metavar="HOST",
-                   help="Host address to bind the published port to. Use 0.0.0.0 for public. (default: 127.0.0.1)")
+    g.add_argument("--profile",
+                   default=None,
+                   choices=[p.value for p in AccessProfile],
+                   metavar="PROFILE",
+                   help=(
+                       "Access profile: one of {%(choices)s}. "
+                       "Sets safe defaults for --bind and firewall rules. "
+                       "  localhost    — loopback only (default). "
+                       "  home-private — LAN access; requires --lan-cidr. "
+                       "  vpn-only     — VPN interface access (Tailscale). "
+                       "  public       — internet-facing (combine with --domain or --open-firewall)."
+                   ))
+    g.add_argument("--lan-cidr", default=None, metavar="CIDR",
+                   help="LAN source CIDR for home-private profile (e.g. 192.168.1.0/24). "
+                        "Required when --profile=home-private.")
+    g.add_argument("--bind", default=None, metavar="HOST",
+                   help="Override bind address. Inferred from --profile when omitted. "
+                        "Use 0.0.0.0 for public. (default: 127.0.0.1)")
     g.add_argument("--port", type=int, default=8080,
                    help="Host port to publish. (default: 8080)")
     g.add_argument("--no-publish", action="store_true",
@@ -80,6 +96,12 @@ def build_config(argv: Optional[List[str]] = None) -> Config:
     g = parser.add_argument_group("System")
     g.add_argument("--swap-gib", type=int, default=8, metavar="GIB",
                    help="Swap file size if none exists. (default: 8)")
+    g.add_argument("--no-auto-optimize", action="store_true",
+                   help="Disable host-spec auto tuning (model choice, ctx, memory knobs).")
+    g.add_argument("--tailscale-authkey", default=None, metavar="KEY",
+                   help="Tailscale auth key for non-interactive 'tailscale up'. "
+                        "Only used when --profile=vpn-only. "
+                        "Falls back to TAILSCALE_AUTHKEY env var.")
 
     g = parser.add_argument_group("Authentication")
     g.add_argument("--token", default=None, metavar="TOKEN",
@@ -131,27 +153,58 @@ def build_config(argv: Optional[List[str]] = None) -> Config:
 
     raw = parser.parse_args(argv)
 
+    # Resolve access profile and bind address
+    profile = AccessProfile(raw.profile) if raw.profile else None
+
+    # Derive bind_host from profile when --bind is not explicitly provided
+    if raw.bind is None:
+        if profile in (AccessProfile.HOME_PRIVATE, AccessProfile.PUBLIC):
+            bind_host = "0.0.0.0"
+        else:
+            bind_host = "127.0.0.1"
+    else:
+        bind_host = raw.bind
+
+    # Derive profile from bind_host when --profile is not given (backward compat)
+    if profile is None:
+        if bind_host == "0.0.0.0":
+            profile = AccessProfile.PUBLIC
+        else:
+            profile = AccessProfile.LOCALHOST
+
     # Cross-argument validation
-    if raw.bind == "0.0.0.0" and raw.no_publish:
+    if bind_host == "0.0.0.0" and raw.no_publish:
         parser.error("--bind 0.0.0.0 cannot be combined with --no-publish.")
-    if raw.open_firewall and raw.bind != "0.0.0.0":
+    if raw.open_firewall and bind_host != "0.0.0.0":
         parser.error("--open-firewall requires --bind 0.0.0.0.")
-    if raw.domain and raw.bind != "127.0.0.1":
+    if raw.domain and bind_host != "127.0.0.1":
         parser.error("--domain requires --bind 127.0.0.1 (NGINX proxies to loopback).")
     if raw.domain and not raw.certbot_email:
         parser.error("--certbot-email is required when --domain is set.")
     if raw.certbot_email and not raw.domain:
         parser.error("--certbot-email has no effect without --domain.")
+    if profile == AccessProfile.HOME_PRIVATE and not raw.lan_cidr:
+        parser.error("--profile=home-private requires --lan-cidr (e.g. 192.168.1.0/24).")
+    if raw.lan_cidr and profile != AccessProfile.HOME_PRIVATE:
+        parser.error("--lan-cidr is only valid with --profile=home-private.")
 
     hf_token: Optional[str] = raw.hf_token or os.environ.get("HF_TOKEN") or None
-
-    network = NetworkConfig(
-        bind_host=raw.bind,
-        port=raw.port,
-        publish=not raw.no_publish,
-        open_firewall=raw.open_firewall,
-        configure_ufw=not raw.skip_ufw,
+    tailscale_authkey: Optional[str] = (
+        raw.tailscale_authkey or os.environ.get("TAILSCALE_AUTHKEY") or None
     )
+
+    try:
+        network = NetworkConfig(
+            bind_host=bind_host,
+            port=raw.port,
+            publish=not raw.no_publish,
+            open_firewall=raw.open_firewall,
+            configure_ufw=not raw.skip_ufw,
+            access_profile=profile,
+            lan_cidr=raw.lan_cidr or None,
+        )
+    except ValueError as exc:
+        parser.error(str(exc))
     llm_spec = ModelSpec(
         hf_repo=raw.llm_repo,
         candidate_patterns=[p.strip() for p in raw.llm_candidates.split(",") if p.strip()],
@@ -176,10 +229,12 @@ def build_config(argv: Optional[List[str]] = None) -> Config:
         skip_download=raw.skip_download,
         llm=llm_spec,
         emb=emb_spec,
+        auto_optimize=not raw.no_auto_optimize,
         allow_unverified_downloads=raw.allow_unverified_downloads,
         domain=raw.domain or None,
         certbot_email=raw.certbot_email or None,
         auth_mode=AuthMode(raw.auth_mode),
+        tailscale_authkey=tailscale_authkey,
     )
 
 
