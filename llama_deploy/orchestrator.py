@@ -755,10 +755,12 @@ def run_deploy(cfg) -> None:
         health_step = Step(
             "Wait for /health",
             health_fn,
+            skip_if=lambda: cfg.skip_health_check,
         )
         smoke_step = Step(
             "Smoke tests (OpenAI-compatible routes)",
             lambda: curl_smoke_tests(_loopback_url(), token_step.result.value, llm_step.result, emb_step.result),
+            skip_if=lambda: cfg.skip_health_check,
         )
     else:
         def _internal_test() -> None:
@@ -815,8 +817,10 @@ def run_deploy(cfg) -> None:
                 f"-H 'Authorization: Bearer {token_step.result.value}' | head -c 800\""
             )
 
-        health_step = Step("Internal network smoke test", _internal_test)
-        smoke_step  = Step("Sanity checks", lambda: sanity_checks(cfg))
+        health_step = Step("Internal network smoke test", _internal_test,
+                           skip_if=lambda: cfg.skip_health_check)
+        smoke_step  = Step("Sanity checks", lambda: sanity_checks(cfg),
+                           skip_if=lambda: cfg.skip_health_check)
 
     sanity_step        = Step("Sanity checks (ports + logs)", lambda: sanity_checks(cfg))
     profile_check_step = Step("Profile smoke-checks",         lambda: profile_smoke_checks(cfg))
