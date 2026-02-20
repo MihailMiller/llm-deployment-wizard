@@ -60,7 +60,7 @@ def write_models_ini(
 [{llm.effective_alias}]
 model = /models/{llm.resolved_filename}
 parallel = {parallel}
-jinja = false
+jinja = true
 load-on-startup = {llm_startup}
 c = {llm.ctx_len}
 
