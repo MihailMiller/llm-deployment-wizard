@@ -267,22 +267,28 @@ def build_config(argv: Optional[List[str]] = None) -> Config:
 
 def _detect_auth_mode(base_dir: Path) -> AuthMode:
     """
-    Infer token auth mode from on-disk secrets.
+    Infer token auth mode from on-disk artifacts.
 
     Priority:
-      1) token_hashes.json (hashed) vs api_keys (plaintext)
-      2) tokens.json record shape
-      3) plaintext fallback for empty/new stores
-    """
-    secrets = base_dir / "secrets"
-    hash_file = secrets / "token_hashes.json"
-    key_file = secrets / "api_keys"
-    token_file = secrets / "tokens.json"
+      1) docker-compose.yml: presence of llama-auth sidecar → hashed
+      2) tokens.json record shape (active hashed record wins)
+      3) token_hashes.json (hashed) vs api_keys (plaintext) existence
+      4) plaintext fallback for empty/new stores
 
-    if hash_file.exists() and not key_file.exists():
-        return AuthMode.HASHED
-    if key_file.exists() and not hash_file.exists():
-        return AuthMode.PLAINTEXT
+    Checking docker-compose.yml first avoids being misled by a stale api_keys
+    file left over from a previous plaintext-mode deploy when the service has
+    since been redeployed in hashed mode.
+    """
+    compose_path = base_dir / "docker-compose.yml"
+    if compose_path.exists():
+        try:
+            if "llama-auth" in compose_path.read_text(encoding="utf-8"):
+                return AuthMode.HASHED
+        except Exception:
+            pass
+
+    secrets = base_dir / "secrets"
+    token_file = secrets / "tokens.json"
 
     if token_file.exists():
         try:
@@ -290,17 +296,20 @@ def _detect_auth_mode(base_dir: Path) -> AuthMode:
             for rec in data.get("tokens", []):
                 if rec.get("hash") and not rec.get("value"):
                     return AuthMode.HASHED
-                if rec.get("value"):
-                    return AuthMode.PLAINTEXT
         except Exception:
             pass
+
+    hash_file = secrets / "token_hashes.json"
+    key_file  = secrets / "api_keys"
+    if hash_file.exists() and not key_file.exists():
+        return AuthMode.HASHED
 
     return AuthMode.PLAINTEXT
 
 
-def _tokens_list(base_dir: Path) -> None:
+def _tokens_list(base_dir: Path, auth_mode: AuthMode) -> None:
     from llama_deploy.tokens import TokenStore
-    store = TokenStore(base_dir / "secrets", auth_mode=_detect_auth_mode(base_dir))
+    store = TokenStore(base_dir / "secrets", auth_mode=auth_mode)
     tokens = store.list_tokens()
     if not tokens:
         print("No tokens found.")
@@ -328,9 +337,9 @@ def _tokens_list(base_dir: Path) -> None:
     print(f"{active_count} active, {revoked_count} revoked\n")
 
 
-def _tokens_create(base_dir: Path, name: str) -> None:
+def _tokens_create(base_dir: Path, name: str, auth_mode: AuthMode) -> None:
     from llama_deploy.tokens import TokenStore
-    store = TokenStore(base_dir / "secrets", auth_mode=_detect_auth_mode(base_dir))
+    store = TokenStore(base_dir / "secrets", auth_mode=auth_mode)
     record = store.create_token(name)
     print(f'\nCreated token "{record.name}":')
     print(f"  ID    : {record.id}")
@@ -346,9 +355,9 @@ def _tokens_create(base_dir: Path, name: str) -> None:
         print(f"     docker compose -f {base_dir}/docker-compose.yml restart llama\n")
 
 
-def _tokens_revoke(base_dir: Path, token_id: str) -> None:
+def _tokens_revoke(base_dir: Path, token_id: str, auth_mode: AuthMode) -> None:
     from llama_deploy.tokens import TokenStore
-    store = TokenStore(base_dir / "secrets", auth_mode=_detect_auth_mode(base_dir))
+    store = TokenStore(base_dir / "secrets", auth_mode=auth_mode)
     try:
         record = store.revoke_token(token_id)
     except KeyError as e:
@@ -372,9 +381,9 @@ def _tokens_revoke(base_dir: Path, token_id: str) -> None:
         print(f"     Create a new token: python -m llama_deploy tokens create --name <name>\n")
 
 
-def _tokens_show(base_dir: Path, token_id: str) -> None:
+def _tokens_show(base_dir: Path, token_id: str, auth_mode: AuthMode) -> None:
     from llama_deploy.tokens import TokenStore
-    store = TokenStore(base_dir / "secrets", auth_mode=_detect_auth_mode(base_dir))
+    store = TokenStore(base_dir / "secrets", auth_mode=auth_mode)
     try:
         record = store.show_token(token_id)
     except (KeyError, ValueError) as e:
@@ -488,6 +497,10 @@ def _dispatch_tokens(argv: List[str]) -> None:
     )
     parser.add_argument("--base-dir", default="/opt/llama", metavar="DIR",
                         help="Base directory used during deployment. (default: /opt/llama)")
+    parser.add_argument("--auth-mode", default=None, choices=[m.value for m in AuthMode],
+                        metavar="MODE",
+                        help="Override auth mode detection: 'plaintext' or 'hashed'. "
+                             "Auto-detected from docker-compose.yml when omitted.")
     sub = parser.add_subparsers(dest="action", required=True)
 
     sub.add_parser("list", help="List all tokens (including revoked).")
@@ -504,12 +517,13 @@ def _dispatch_tokens(argv: List[str]) -> None:
 
     args = parser.parse_args(argv)
     base = Path(args.base_dir)
+    auth_mode = AuthMode(args.auth_mode) if args.auth_mode else _detect_auth_mode(base)
 
     if args.action == "list":
-        _tokens_list(base)
+        _tokens_list(base, auth_mode)
     elif args.action == "create":
-        _tokens_create(base, args.name)
+        _tokens_create(base, args.name, auth_mode)
     elif args.action == "revoke":
-        _tokens_revoke(base, args.id)
+        _tokens_revoke(base, args.id, auth_mode)
     elif args.action == "show":
-        _tokens_show(base, args.id)
+        _tokens_show(base, args.id, auth_mode)

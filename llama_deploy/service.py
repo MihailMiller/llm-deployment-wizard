@@ -48,34 +48,28 @@ def write_models_ini(
     """
     assert llm.resolved_filename, "LLM ModelSpec must be resolved before writing INI"
     assert emb.resolved_filename, "Embedding ModelSpec must be resolved before writing INI"
-    # Keep implicit/local presets off by default so startup count is fully
-    # controlled by explicit model sections below (important for models_max=1).
-    global_startup = "0"
     # With models_max=1 we avoid preloading both model families and let router
     # autoload on demand to stay within the startup cap.
-    llm_startup = "1" if models_max >= 2 else "0"
-    emb_startup = "1" if models_max >= 2 else "0"
+    llm_startup = "true" if models_max >= 2 else "false"
+    emb_startup = "true" if models_max >= 2 else "false"
 
     content = f"""; NOTE:
-; Top-level keys (outside any [section]) can be interpreted by some
-; llama-server builds as a synthetic "default" preset. We intentionally avoid
-; them to prevent extra startup model slots.
-
-[*]
-parallel = {parallel}
-jinja = 0
-load-on-startup = {global_startup}
-c = {llm.ctx_len}
+; Some llama-server builds treat wildcard sections as a concrete "default" preset.
+; To avoid creating an extra third model entry, we write only explicit sections.
 
 [{llm.effective_alias}]
 model = /models/{llm.resolved_filename}
+parallel = {parallel}
+jinja = false
 load-on-startup = {llm_startup}
 c = {llm.ctx_len}
 
 [{emb.effective_alias}]
 model = /models/{emb.resolved_filename}
+parallel = {parallel}
+jinja = false
 load-on-startup = {emb_startup}
-embeddings = 1
+embeddings = true
 pooling = last
 c = {emb.ctx_len}
 """
