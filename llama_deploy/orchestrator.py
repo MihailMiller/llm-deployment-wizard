@@ -450,23 +450,40 @@ def _ensure_first_token(cfg) -> TokenRuntime:
     """
     Return token material for deployment validation.
 
-    If no token exists yet, create the first token (honoring cfg.api_token when
-    provided). In hashed mode on re-deploy, existing token plaintext is not
-    recoverable; create a temporary token for smoke tests and revoke it after
-    deployment.
+    Plaintext mode: reuse existing token if one exists; create on first run.
+    Hashed mode: only reuse tokens that were created in hashed mode (have a
+    stored hash). Plaintext-mode tokens are incompatible — the sidecar reads
+    token_hashes.json and a plaintext token has no entry there. On migration
+    from plaintext → hashed, a new hashed token is created automatically.
     """
+    from llama_deploy.config import AuthMode
     from llama_deploy.tokens import TokenStore
 
     store = TokenStore(cfg.secrets_dir, auth_mode=cfg.auth_mode)
     active = store.active_tokens()
+
+    if cfg.auth_mode == AuthMode.HASHED:
+        hashed = [t for t in active if t.hash]
+        if hashed:
+            # Re-deploy in hashed mode: proper tokens exist.
+            # Plaintext is unrecoverable; use a temporary smoke-test token.
+            smoke = store.create_token("__deploy-smoke-test")
+            tqdm.write(f"[OK] Created temporary smoke-test token ({smoke.id}) for validation.")
+            return TokenRuntime(value=smoke.value, temporary_id=smoke.id)
+        if active:
+            tqdm.write(
+                f"[WARN] {len(active)} plaintext token(s) found but unusable in hashed mode "
+                "(no hash stored) — creating a new hashed token."
+            )
+        record = store.create_token(cfg.api_token_name, value=cfg.api_token)
+        tqdm.write(f"[OK] Created token '{record.name}' ({record.id})")
+        return TokenRuntime(value=record.value)
+
+    # Plaintext mode
     if active:
         tqdm.write(f"[OK] Existing token found in store: {active[0].id}")
         if active[0].value:
             return TokenRuntime(value=active[0].value)
-
-        smoke = store.create_token("__deploy-smoke-test")
-        tqdm.write(f"[OK] Created temporary smoke-test token ({smoke.id}) for validation.")
-        return TokenRuntime(value=smoke.value, temporary_id=smoke.id)
 
     record = store.create_token(cfg.api_token_name, value=cfg.api_token)
     tqdm.write(f"[OK] Created token '{record.name}' ({record.id})")

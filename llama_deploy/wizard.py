@@ -623,6 +623,12 @@ def run_wizard() -> Config:
         docker_network_mode=docker_network_mode,
     )
 
+    # Apply auto-optimize before review so the user sees the final model/ctx
+    # that will actually be deployed, not the pre-optimized defaults.
+    if cfg.auto_optimize:
+        from llama_deploy.orchestrator import _auto_optimize_cfg
+        cfg = _auto_optimize_cfg(cfg)
+
     _review(cfg)
 
     if not _confirm("Proceed with deployment?", default=True):
